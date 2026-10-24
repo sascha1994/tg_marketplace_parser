@@ -1,0 +1,21 @@
+--- parser_refactored.py
++++ parser_refactored.py
+@@
+                     async with self.http_session.head(
+                         current_url,
+                         allow_redirects=False,
+                     ) as response:
+                         status = response.status
+                         location = response.headers.get("Location")
+-                        await response.release()
++                        response.release()
+@@
+                         async with self.http_session.get(
+                             current_url,
+                             allow_redirects=False,
+                             read_until_eof=False,
+                         ) as response:
+                             status = response.status
+                             location = response.headers.get("Location")
+-                            await response.release()
++                            response.release()

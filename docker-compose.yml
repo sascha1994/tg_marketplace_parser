@@ -1,0 +1,19 @@
+services:
+  parser:
+    build: .
+    image: tg_deals_parser:${APP_VERSION:-1.0.2}
+    container_name: tg_deals_parser
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    command: ["python", "-u", "/app/parser.py"]
+
+    volumes:
+      - ./data:/app/data
+      - ./parser.py:/app/parser.py:ro
