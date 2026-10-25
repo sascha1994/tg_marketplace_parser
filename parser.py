@@ -155,6 +155,7 @@ ALLOWED_DOMAINS = frozenset(
     {
         "wildberries.ru",
         "wildberries.by",
+        "wildberries.kz",
         "wb.ru",
         "ozon.ru",
         "ozon.by",
@@ -162,7 +163,15 @@ ALLOWED_DOMAINS = frozenset(
     }
 )
 OZON_DOMAINS = ("ozon.ru", "ozon.by", "ozon.kz")
-WB_DOMAINS = ("wildberries.ru", "wildberries.by", "wb.ru")
+WB_DOMAINS = ("wildberries.ru", "wildberries.by", "wildberries.kz", "wb.ru")
+WB_COOKIE_DOMAINS = (
+    "wildberries.by",
+    "wildberries.ru",
+    "wb.ru",
+    "card.wb.ru",
+    "search.wb.ru",
+    "u-card.wb.ru",
+)
 
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -243,11 +252,20 @@ IMAGE_READ_LIMIT = 8_000_000
 
 URL_RE = re.compile(r"https?://[^\s<>\[\]\(\)\"']+", re.IGNORECASE)
 
-# Поддержка любых поддоменов wildberries.(ru|by) и короткого домена wb.ru
+# Поддержка любых поддоменов wildberries.(ru|by|kz), короткого домена wb.ru, путей /catalog/<sku> и ?card=<sku> / ?nm=<sku>
 WB_SKU_RE = re.compile(
-    r"(?:[a-z0-9-]+\.)?(?:wildberries\.(?:ru|by)|wb\.ru)/catalog/(\d+)",
+    r"(?:[a-z0-9-]+\.)?(?:wildberries\.(?:ru|by|kz)|wb\.ru)/"
+    r"(?:catalog/(\d+)|product/?\?(?:[^#\"'\s<>]*&)?card=(\d+)|[^#\"'\s<>]*?[?&]nm=(\d+))",
     re.IGNORECASE,
 )
+
+WB_BASKET_HOST_IN_URL_RE = re.compile(
+    r"https?://(basket-\d+\.(?:wbbasket\.ru|wbcontent\.net))/vol(\d+)/",
+    re.IGNORECASE,
+)
+
+# Глобальный кэш соответствия vol -> basket-XX.wbbasket.ru (обновляется динамически при пробинге и из браузера)
+WB_BASKET_VOL_CACHE: dict[int, str] = {}
 
 # Поддержка любых поддоменов ozon.(ru|by|kz), путей /product/...-<sku> и /context/detail/id/<sku>
 OZON_SKU_RE = re.compile(
@@ -519,6 +537,10 @@ class Settings:
     @property
     def cookies_cache_path(self) -> str:
         return os.path.join(self.data_dir, "ozon_cookies.json")
+
+    @property
+    def wb_baskets_cache_path(self) -> str:
+        return os.path.join(self.data_dir, "wb_baskets_cache.json")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -840,9 +862,20 @@ def validate_marketplace_url(url: str) -> bool:
         return False
 
 
+def extract_wb_sku(url: str) -> str | None:
+    """Извлекает артикул Wildberries из любого поддерживаемого формата ссылки WB."""
+    match = WB_SKU_RE.search(url or "")
+    if not match:
+        return None
+    for group in match.groups():
+        if group:
+            return group
+    return None
+
+
 def has_product_sku(url: str) -> bool:
     """Проверяет, содержит ли URL уже распознаваемый артикул WB или Ozon."""
-    return bool(WB_SKU_RE.search(url) or OZON_SKU_RE.search(url))
+    return bool(extract_wb_sku(url) or OZON_SKU_RE.search(url))
 
 
 def is_non_product_url(url: str) -> bool:
@@ -1199,7 +1232,15 @@ def extract_ozon_avg_price_from_state(
 
 
 def get_wb_basket_host(vol: int) -> str:
-    """Определяет номер корзины Wildberries (basket-01..basket-35.wbbasket.ru) по vol = sku // 100000."""
+    """Определяет хост корзины Wildberries (basket-01..basket-70.wbbasket.ru) по vol = sku // 100000.
+
+    Сначала проверяет динамический кэш WB_BASKET_VOL_CACHE, затем актуальную таблицу диапазонов
+    и формулу шага шардов для новых 9- и 10-значных артикулов.
+    """
+    cached = WB_BASKET_VOL_CACHE.get(vol)
+    if cached:
+        return cached
+
     ranges = (
         (143, "01"),
         (287, "02"),
@@ -1235,14 +1276,46 @@ def get_wb_basket_host(vol: int) -> str:
         (6749, "32"),
         (7061, "33"),
         (7373, "34"),
+        (7685, "35"),
+        (7997, "36"),
+        (8309, "37"),
+        (8621, "38"),
+        (8933, "39"),
+        (9245, "40"),
+        (9557, "41"),
+        (9869, "42"),
+        (10181, "43"),
+        (10493, "44"),
+        (10805, "45"),
     )
     for max_vol, shard in ranges:
         if vol <= max_vol:
             return f"basket-{shard}.wbbasket.ru"
-    return "basket-35.wbbasket.ru"
+
+    # Для более высоких vol (включая 10-значные артикулы) вычисляем ориентировочный шард с шагом 312
+    est_shard = min(70, 45 + (vol - 10806) // 312 + 1)
+    return f"basket-{est_shard:02d}.wbbasket.ru"
 
 
-def get_wb_card_image_url(sku: str | int) -> str:
+def get_wb_candidate_basket_hosts(vol: int) -> list[str]:
+    """Формирует упорядоченный список кандидатов basket-XX.wbbasket.ru для динамического пробинга по vol."""
+    primary = get_wb_basket_host(vol)
+    m = re.search(r"basket-(\d+)\.", primary)
+    center_num = int(m.group(1)) if m else 35
+
+    ordered_nums: list[int] = [center_num]
+    for delta in range(1, 70):
+        for candidate in (center_num + delta, center_num - delta):
+            if 1 <= candidate <= 70 and candidate not in ordered_nums:
+                ordered_nums.append(candidate)
+
+    hosts = [f"basket-{num:02d}.wbbasket.ru" for num in ordered_nums]
+    if primary not in hosts:
+        hosts.insert(0, primary)
+    return hosts
+
+
+def get_wb_card_image_url(sku: str | int, basket_host: str | None = None) -> str:
     """Формирует прямую ссылку на главное фото карточки товара Wildberries на сервере корзины."""
     try:
         sku_int = int(sku)
@@ -1250,8 +1323,8 @@ def get_wb_card_image_url(sku: str | int) -> str:
         return ""
     vol = sku_int // 100_000
     part = sku_int // 1_000
-    basket_host = get_wb_basket_host(vol)
-    return f"https://{basket_host}/vol{vol}/part{part}/{sku_int}/images/big/1.webp"
+    host = basket_host or get_wb_basket_host(vol)
+    return f"https://{host}/vol{vol}/part{part}/{sku_int}/images/big/1.webp"
 
 
 def parse_wb_price_history_avg(
@@ -1296,42 +1369,118 @@ def parse_wb_price_history_avg(
     return round(sum(target_slice) / len(target_slice), 2)
 
 
+def parse_wb_price_history_latest(
+    history_list: Any,
+    *,
+    rub_to_byn_rate: float = 0.0345,
+) -> float | None:
+    """Извлекает последнюю известную цену товара в BYN из истории цен Wildberries (price-history.json)."""
+    if not isinstance(history_list, list) or not history_list:
+        return None
+
+    best_dt = -1
+    latest_byn: float | None = None
+
+    for idx, entry in enumerate(history_list):
+        if not isinstance(entry, dict):
+            continue
+        dt = int(entry.get("dt") or idx)
+        price_dict = entry.get("price")
+        if not isinstance(price_dict, dict):
+            continue
+
+        byn_val: float | None = None
+        if price_dict.get("BYN"):
+            with suppress(TypeError, ValueError):
+                byn_val = round(float(price_dict["BYN"]) / 100.0, 2)
+        elif price_dict.get("RUB"):
+            with suppress(TypeError, ValueError):
+                rub_val = float(price_dict["RUB"]) / 100.0
+                byn_val = convert_to_byn(rub_val, "RUB", rub_to_byn_rate)
+
+        if byn_val is not None and byn_val > 0 and dt >= best_dt:
+            best_dt = dt
+            latest_byn = byn_val
+
+    return latest_byn
+
+
+def extract_price_from_post_text(
+    text: str,
+    *,
+    rub_to_byn_rate: float = 0.0345,
+) -> float | None:
+    """Извлекает явно указанную цену с валютой (BYN / бел. руб. / ₽ / руб.) из текста исходного поста."""
+    if not text:
+        return None
+    clean = clean_html_tags(text)
+    explicit_re = re.compile(
+        r"(?:цена|стоимость|всего|за|по\s+цене)?\s*[:\-–—]?\s*"
+        r"(\d[\d\s\u00a0\u202f]*(?:[.,]\d{1,2})?)\s*"
+        r"(byn|бел\.?\s*руб\.?|бр|₽|рос\.?\s*руб\.?|руб\.?|rub)\b",
+        re.IGNORECASE,
+    )
+    for match in explicit_re.finditer(clean):
+        raw_fragment = f"{match.group(1)} {match.group(2)}"
+        val, curr = parse_price_value_and_currency(raw_fragment, default_currency="BYN")
+        byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
+        if byn_val is not None and 0.2 <= byn_val <= 50000:
+            return byn_val
+    return None
+
+
 def parse_wb_detail_payload(
     payload: dict[str, Any],
     *,
+    sku: str | int | None = None,
     currency: str = "BYN",
     rub_to_byn_rate: float = 0.0345,
 ) -> ProductCardData | None:
-    """Извлекает название, цену в BYN, ссылку на фото и наличие из ответа card.wb.ru/cards/v2(v4)/detail."""
+    """Извлекает название, цену в BYN, ссылку на фото и наличие из ответа card.wb.ru / u-card.wb.ru / search.wb.ru."""
     if not isinstance(payload, dict):
         return None
 
     data_block = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     products = data_block.get("products")
-    if not isinstance(products, list):
-        return None
+    item: dict[str, Any] | None = None
 
-    if not products:
-        return ProductCardData(in_stock=False)
+    if isinstance(products, list):
+        if not products:
+            return ProductCardData(in_stock=False)
+        if sku is not None:
+            sku_str = str(sku).strip()
+            for candidate in products:
+                if isinstance(candidate, dict) and str(candidate.get("id") or "").strip() == sku_str:
+                    item = candidate
+                    break
+            if item is None:
+                # В поисковой выдаче могли прийти другие товары — не путаем их с искомым SKU
+                if len(products) == 1 and isinstance(products[0], dict) and not products[0].get("id"):
+                    item = products[0]
+                else:
+                    return None
+        else:
+            item = products[0] if isinstance(products[0], dict) else None
+    elif isinstance(data_block.get("id"), int) and isinstance(data_block.get("sizes"), list):
+        item = data_block
 
-    item = products[0]
     if not isinstance(item, dict):
         return None
 
-    sku_id = item.get("id")
+    sku_id = item.get("id") or sku
     image_url = get_wb_card_image_url(sku_id) if sku_id else ""
 
-    raw_name = str(item.get("name") or "").strip()
+    raw_name = str(item.get("name") or item.get("imt_name") or "").strip()
     raw_brand = str(item.get("brand") or "").strip()
     rating = None
     with suppress(TypeError, ValueError):
-        rating_val = item.get("reviewRating") or item.get("rating")
+        rating_val = item.get("reviewRating") or item.get("nmReviewRating") or item.get("rating")
         if rating_val is not None:
             rating = float(rating_val)
 
     reviews_count = None
     with suppress(TypeError, ValueError):
-        fb_val = item.get("feedbacks")
+        fb_val = item.get("feedbacks") or item.get("nmFeedbacks")
         if fb_val is not None:
             reviews_count = int(fb_val)
 
@@ -1339,7 +1488,8 @@ def parse_wb_detail_payload(
     sizes = item.get("sizes") if isinstance(item.get("sizes"), list) else []
 
     total_stocks_qty = 0
-    has_explicit_stocks_list = False
+    has_nonempty_stocks_entries = False
+    has_size_wh_or_payload = False
     candidate_product_prices: list[float] = []
     candidate_basic_prices: list[float] = []
     fallback_product_prices: list[float] = []
@@ -1348,56 +1498,104 @@ def parse_wb_detail_payload(
     for size in sizes:
         if not isinstance(size, dict):
             continue
+        if size.get("wh") or size.get("payload") or size.get("Sign"):
+            has_size_wh_or_payload = True
+
         stocks = size.get("stocks")
         size_qty = 0
-        if isinstance(stocks, list):
-            has_explicit_stocks_list = True
+        if isinstance(stocks, list) and stocks:
             for st in stocks:
                 if isinstance(st, dict):
-                    with suppress(TypeError, ValueError):
-                        size_qty += int(st.get("qty") or 0)
+                    if "qty" in st and st.get("qty") is not None:
+                        has_nonempty_stocks_entries = True
+                        with suppress(TypeError, ValueError):
+                            size_qty += int(st.get("qty") or 0)
+                    elif st.get("wh"):
+                        has_size_wh_or_payload = True
             total_stocks_qty += size_qty
 
         price_obj = size.get("price")
+        prod_kop = None
+        basic_kop = None
         if isinstance(price_obj, dict):
-            prod_kop = price_obj.get("product") or price_obj.get("total")
+            prod_kop = (
+                price_obj.get("product")
+                or price_obj.get("total")
+                or price_obj.get("sale")
+                or price_obj.get("client")
+            )
             basic_kop = price_obj.get("basic")
-            if prod_kop and int(prod_kop) > 0:
-                val = int(prod_kop) / 100.0
-                fallback_product_prices.append(val)
-                if size_qty > 0 or not isinstance(stocks, list):
-                    candidate_product_prices.append(val)
-            if basic_kop and int(basic_kop) > 0:
-                b_val = int(basic_kop) / 100.0
-                fallback_basic_prices.append(b_val)
-                if size_qty > 0 or not isinstance(stocks, list):
-                    candidate_basic_prices.append(b_val)
+        if not prod_kop:
+            prod_kop = size.get("salePriceU") or size.get("priceU")
+        if not basic_kop:
+            basic_kop = size.get("priceU")
+
+        if prod_kop:
+            with suppress(TypeError, ValueError):
+                if int(prod_kop) > 0:
+                    val = int(prod_kop) / 100.0
+                    fallback_product_prices.append(val)
+                    if size_qty > 0 or not has_nonempty_stocks_entries or size.get("wh") or size.get("payload"):
+                        candidate_product_prices.append(val)
+        if basic_kop:
+            with suppress(TypeError, ValueError):
+                if int(basic_kop) > 0:
+                    b_val = int(basic_kop) / 100.0
+                    fallback_basic_prices.append(b_val)
+                    if size_qty > 0 or not has_nonempty_stocks_entries or size.get("wh") or size.get("payload"):
+                        candidate_basic_prices.append(b_val)
 
     if not candidate_product_prices and not fallback_product_prices:
-        sale_u = item.get("salePriceU") or item.get("extended", {}).get("clientPriceU") or item.get("priceU")
-        basic_u = item.get("priceU")
-        if sale_u and int(sale_u) > 0:
-            fallback_product_prices.append(int(sale_u) / 100.0)
-        if basic_u and int(basic_u) > 0:
-            fallback_basic_prices.append(int(basic_u) / 100.0)
-
-    if isinstance(total_quantity, int) and total_quantity <= 0:
-        in_stock = False
-    elif has_explicit_stocks_list and total_stocks_qty <= 0:
-        in_stock = False
-    elif not candidate_product_prices and not fallback_product_prices:
-        in_stock = False
-    else:
-        in_stock = True
+        extended = item.get("extended") if isinstance(item.get("extended"), dict) else {}
+        sale_u = (
+            item.get("salePriceU")
+            or extended.get("clientPriceU")
+            or extended.get("basicPriceU")
+            or item.get("priceU")
+        )
+        basic_u = item.get("priceU") or extended.get("basicPriceU")
+        if sale_u:
+            with suppress(TypeError, ValueError):
+                if int(sale_u) > 0:
+                    fallback_product_prices.append(int(sale_u) / 100.0)
+        if basic_u:
+            with suppress(TypeError, ValueError):
+                if int(basic_u) > 0:
+                    fallback_basic_prices.append(int(basic_u) / 100.0)
 
     active_prices = candidate_product_prices or fallback_product_prices
     active_basic = candidate_basic_prices or fallback_basic_prices
 
-    raw_price = min(active_prices) if active_prices else None
-    raw_old_price = max(active_basic) if active_basic else None
+    # Логика наличия WB (v2/v4/search):
+    # В актуальном API WB у размеров в наличии всегда присутствует блок price (product/total > 0),
+    # при этом массив stocks может быть пустым [] (остатки скрыты) или не содержать поля qty.
+    # У закончившихся товаров блок price в sizes отсутствует, а totalQuantity == 0.
+    if active_prices:
+        if (
+            isinstance(total_quantity, int)
+            and total_quantity <= 0
+            and has_nonempty_stocks_entries
+            and total_stocks_qty <= 0
+            and not has_size_wh_or_payload
+        ):
+            in_stock = False
+        else:
+            in_stock = True
+    else:
+        if isinstance(total_quantity, int) and total_quantity <= 0:
+            in_stock = False
+        elif has_nonempty_stocks_entries and total_stocks_qty <= 0:
+            in_stock = False
+        elif sizes and not has_size_wh_or_payload:
+            in_stock = False
+        else:
+            in_stock = None
 
-    price_byn = convert_to_byn(raw_price, currency, rub_to_byn_rate) if in_stock else None
-    old_price_byn = convert_to_byn(raw_old_price, currency, rub_to_byn_rate) if in_stock else None
+    raw_price = min(active_prices) if (active_prices and in_stock is not False) else None
+    raw_old_price = max(active_basic) if (active_basic and in_stock is not False) else None
+
+    price_byn = convert_to_byn(raw_price, currency, rub_to_byn_rate) if in_stock is not False else None
+    old_price_byn = convert_to_byn(raw_old_price, currency, rub_to_byn_rate) if in_stock is not False else None
 
     return ProductCardData(
         title=clean_product_title(raw_name, raw_brand),
@@ -1901,13 +2099,24 @@ def parse_webpage_preview_card(
 
 
 def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData | None) -> ProductCardData | None:
-    """Объединяет данные карточки из двух источников, сохраняя наиболее полные поля."""
+    """Объединяет данные карточки из двух источников, сохраняя наиболее полные поля.
+
+    Положительное наличие с актуальной ценой (in_stock=True + price_byn > 0) на одном из регионов/эндпоинтов
+    имеет приоритет над региональным отказом (in_stock=False) другого региона.
+    """
     if primary is None:
         return secondary
     if secondary is None:
         return primary
 
-    if primary.in_stock is False or secondary.in_stock is False:
+    primary_has_live_offer = primary.in_stock is True and primary.price_byn is not None and primary.price_byn > 0
+    secondary_has_live_offer = secondary.in_stock is True and secondary.price_byn is not None and secondary.price_byn > 0
+
+    if primary_has_live_offer or secondary_has_live_offer:
+        in_stock: bool | None = True
+    elif primary.in_stock is False and secondary.in_stock is not True:
+        in_stock = False
+    elif secondary.in_stock is False and primary.in_stock is not True:
         in_stock = False
     elif primary.in_stock is True or secondary.in_stock is True:
         in_stock = True
@@ -1926,7 +2135,15 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
         primary.avg_month_price_byn if primary.avg_month_price_byn is not None else secondary.avg_month_price_byn
     ) if in_stock is not False else None
     old_price_byn = (primary.old_price_byn if primary.old_price_byn is not None else secondary.old_price_byn) if in_stock is not False else None
+
+    # Если во втором источнике ссылка на фото указывает на проверенный в кэше баскет WB, отдаём ей приоритет
     image_url = primary.image_url or secondary.image_url
+    if primary.image_url and secondary.image_url and primary.image_url != secondary.image_url:
+        m_sec = WB_BASKET_HOST_IN_URL_RE.search(secondary.image_url)
+        if m_sec:
+            sec_host, sec_vol = m_sec.group(1).lower(), int(m_sec.group(2))
+            if WB_BASKET_VOL_CACHE.get(sec_vol) == sec_host:
+                image_url = secondary.image_url
 
     return ProductCardData(
         title=title,
@@ -1943,7 +2160,7 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
 
 
 def extract_product_url_from_text(raw_text: str, base_url: str) -> str | None:
-    """Извлекает ссылку на товар или SKU из HTML, JSON (composer-api) или редиректа."""
+    """Извлекает ссылку на товар (WB или Ozon) или SKU из HTML, JSON или редиректа."""
     if not raw_text:
         return None
 
@@ -1954,9 +2171,21 @@ def extract_product_url_from_text(raw_text: str, base_url: str) -> str | None:
         with suppress(Exception):
             normalized_variants.append(unquote(raw_text))
 
-    canonical_host = resolve_ozon_canonical_host(urlparse(base_url).hostname)
+    base_host = normalize_host(urlparse(base_url).hostname)
+    is_wb = is_wb_host(base_host)
+    canonical_host = resolve_ozon_canonical_host(base_host)
 
     for variant in normalized_variants:
+        wb_sku = extract_wb_sku(variant)
+        if wb_sku:
+            return f"https://www.wildberries.by/catalog/{wb_sku}/detail.aspx"
+
+        if is_wb:
+            m_wb_id = re.search(r"\"(?:nmId|nm_id|nm)\"\s*:\s*\"?(\d{6,15})\"?", variant, re.IGNORECASE)
+            if m_wb_id:
+                return f"https://www.wildberries.by/catalog/{m_wb_id.group(1)}/detail.aspx"
+            continue
+
         path_match = OZON_PRODUCT_PATH_RE.search(variant)
         if path_match:
             candidate_path = path_match.group(1).strip("\"'<>\\")
@@ -2011,7 +2240,10 @@ def extract_url_from_webpage_obj(webpage, base_url: str) -> str | None:
         match = TEXT_SKU_RE.search(val)
         if match:
             sku = match.group(1)
-            canonical_host = resolve_ozon_canonical_host(urlparse(base_url).hostname)
+            base_host = normalize_host(urlparse(base_url).hostname)
+            if is_wb_host(base_host):
+                return f"https://www.wildberries.by/catalog/{sku}/detail.aspx"
+            canonical_host = resolve_ozon_canonical_host(base_host)
             return f"https://www.{canonical_host}/product/{sku}/"
 
     return None
@@ -2081,17 +2313,16 @@ def parse_product_info(
     resolved_url: str,
     canonical_host_override: str = "ozon.by",
 ) -> ProductInfo:
-    wb_match = WB_SKU_RE.search(resolved_url)
-    if wb_match:
-        sku = wb_match.group(1)
+    wb_sku = extract_wb_sku(resolved_url) or extract_wb_sku(original_url)
+    if wb_sku:
         return ProductInfo(
             original_url=original_url,
             resolved_url=resolved_url,
             platform="Wildberries",
-            sku=sku,
-            canonical_url=f"https://www.wildberries.by/catalog/{sku}/detail.aspx",
-            sku_key=f"wildberries:{sku}",
-            image_url=get_wb_card_image_url(sku),
+            sku=wb_sku,
+            canonical_url=f"https://www.wildberries.by/catalog/{wb_sku}/detail.aspx",
+            sku_key=f"wildberries:{wb_sku}",
+            image_url=get_wb_card_image_url(wb_sku),
         )
 
     ozon_match = OZON_SKU_RE.search(resolved_url)
@@ -2693,6 +2924,410 @@ class OzonBrowserResolver:
             cookies = await self._export_cookies()
             return None, cookies
 
+    async def fetch_wb_product_card(
+        self,
+        sku: str,
+        *,
+        rub_to_byn_rate: float = 0.0345,
+    ) -> tuple[ProductCardData | None, list[dict]]:
+        """Получает карточку товара Wildberries через браузер Playwright (перехват XHR + чтение DOM).
+
+        Используется как надёжный обход, когда публичные API card.wb.ru / search.wb.ru закрыты антиботом (HTTP 403).
+        """
+        if not self._available or not sku:
+            return None, []
+
+        async with self._lock:
+            if not await self._ensure_context():
+                return None, []
+
+            self._last_used = time.time()
+            assert self._context is not None
+
+            intercepted_card: ProductCardData | None = None
+            intercepted_basket_title = ""
+            intercepted_basket_brand = ""
+            intercepted_avg_byn: float | None = None
+            intercepted_latest_byn: float | None = None
+            intercepted_img_url = ""
+
+            storefronts = (
+                ("www.wildberries.by", "BYN"),
+                ("www.wildberries.ru", "RUB"),
+            )
+
+            for host, default_currency in storefronts:
+                nav_page = await self._context.new_page()
+                await self._apply_cdp_stealth(nav_page)
+
+                async def _handle_wb_response(resp, curr: str = default_currency) -> None:
+                    nonlocal intercepted_card, intercepted_basket_title, intercepted_basket_brand
+                    nonlocal intercepted_avg_byn, intercepted_latest_byn, intercepted_img_url
+                    with suppress(Exception):
+                        r_url = resp.url or ""
+                        m_b = WB_BASKET_HOST_IN_URL_RE.search(r_url)
+                        if m_b:
+                            b_host = m_b.group(1).lower()
+                            b_vol = int(m_b.group(2))
+                            WB_BASKET_VOL_CACHE[b_vol] = b_host
+                            if not intercepted_img_url:
+                                intercepted_img_url = get_wb_card_image_url(sku, basket_host=b_host)
+
+                        if resp.status < 200 or resp.status >= 300:
+                            return
+
+                        if (
+                            ("/cards/" in r_url and "detail" in r_url)
+                            or "/__internal/card/" in r_url
+                            or ("/exactmatch/" in r_url and "search" in r_url)
+                        ):
+                            raw_bytes = await resp.body()
+                            if raw_bytes:
+                                payload = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                                api_curr = "BYN" if "curr=byn" in r_url.lower() else ("RUB" if "curr=rub" in r_url.lower() else curr)
+                                parsed = parse_wb_detail_payload(
+                                    payload,
+                                    sku=sku,
+                                    currency=api_curr,
+                                    rub_to_byn_rate=rub_to_byn_rate,
+                                )
+                                if parsed is not None:
+                                    intercepted_card = merge_card_data(intercepted_card, parsed)
+                        elif r_url.endswith("/card.json"):
+                            raw_bytes = await resp.body()
+                            if raw_bytes:
+                                c_json = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                                if isinstance(c_json, dict):
+                                    imt_n = str(c_json.get("imt_name") or c_json.get("subj_name") or "").strip()
+                                    selling = c_json.get("selling")
+                                    b_n = str(selling.get("brand_name") or "").strip() if isinstance(selling, dict) else ""
+                                    if not b_n:
+                                        b_n = str(c_json.get("brand_name") or "").strip()
+                                    if imt_n:
+                                        intercepted_basket_title = clean_product_title(imt_n, b_n)
+                                    if b_n:
+                                        intercepted_basket_brand = b_n
+                        elif r_url.endswith("/price-history.json"):
+                            raw_bytes = await resp.body()
+                            if raw_bytes:
+                                h_json = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                                if isinstance(h_json, list):
+                                    intercepted_avg_byn = parse_wb_price_history_avg(
+                                        h_json,
+                                        rub_to_byn_rate=rub_to_byn_rate,
+                                    ) or intercepted_avg_byn
+                                    intercepted_latest_byn = parse_wb_price_history_latest(
+                                        h_json,
+                                        rub_to_byn_rate=rub_to_byn_rate,
+                                    ) or intercepted_latest_byn
+
+                nav_page.on("response", lambda r: asyncio.create_task(_handle_wb_response(r)))
+
+                target_url = f"https://{host}/catalog/{sku}/detail.aspx"
+                try:
+                    resp = await nav_page.goto(target_url, wait_until="domcontentloaded", timeout=14_000)
+                    if resp and resp.status == 404:
+                        cookies = await self._export_cookies()
+                        return ProductCardData(in_stock=False), cookies
+
+                    # Ожидаем отрисовки SPA-карточки WB или прохождения антибот-экрана
+                    deadline = time.monotonic() + min(9.0, float(self.settings.browser_challenge_timeout))
+                    while time.monotonic() < deadline:
+                        if intercepted_card and intercepted_card.price_byn is not None and intercepted_card.title:
+                            break
+                        ready = False
+                        with suppress(Exception):
+                            ready = bool(
+                                await nav_page.evaluate(
+                                    """() => {
+                                        const h1 = document.querySelector('h1.product-page__title, [class*="productPage"] h1, h1');
+                                        const price = document.querySelector(
+                                            '.price-block__final-price, .price-block__wallet-price, [class*="priceBlockFinalPrice"], [class*="priceBlockWalletPrice"]'
+                                        );
+                                        const soldOut = document.querySelector(
+                                            '.sold-out-product, .price-block__sold-out, [class*="soldOut"]'
+                                        );
+                                        const bodyTxt = (document.body ? document.body.innerText : '').toLowerCase();
+                                        const notFound = bodyTxt.includes('по вашему запросу ничего не найдено') || bodyTxt.includes('страница не найдена');
+                                        return Boolean((h1 && (price || soldOut)) || notFound);
+                                    }"""
+                                )
+                            )
+                        if ready:
+                            break
+                        await self._simulate_human_interaction(nav_page)
+                        await asyncio.sleep(0.55)
+
+                    # Пробуем также in-page запрос к внутреннему эндпоинту WB из контекста вкладки, если цена ещё не перехвачена
+                    if intercepted_card is None or intercepted_card.price_byn is None:
+                        with suppress(Exception):
+                            inpage_raw = await nav_page.evaluate(
+                                """async ({ sku, dest, spp }) => {
+                                    const urls = [
+                                        `/__internal/card/cards/v4/detail?appType=1&curr=byn&dest=${dest}&spp=${spp}&nm=${sku}`,
+                                        `/__internal/card/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=${spp}&nm=${sku}`,
+                                        `https://card.wb.ru/cards/v4/detail?appType=1&curr=byn&dest=${dest}&spp=${spp}&nm=${sku}`,
+                                        `https://card.wb.ru/cards/v2/detail?appType=1&curr=byn&dest=${dest}&spp=${spp}&nm=${sku}`
+                                    ];
+                                    for (const u of urls) {
+                                        try {
+                                            const r = await fetch(u, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+                                            if (r.ok) {
+                                                const txt = await r.text();
+                                                if (txt && txt.includes('"products"')) {
+                                                    return JSON.stringify({ url: u, body: txt });
+                                                }
+                                            }
+                                        } catch (e) {}
+                                    }
+                                    return '';
+                                }""",
+                                {"sku": str(sku), "dest": self.settings.wb_dest_byn, "spp": self.settings.wb_spp},
+                            )
+                            if inpage_raw:
+                                wrapper = json.loads(inpage_raw)
+                                u_str = str(wrapper.get("url") or "")
+                                b_obj = json.loads(wrapper.get("body") or "{}")
+                                api_curr = "BYN" if "curr=byn" in u_str.lower() else "RUB"
+                                parsed_inpage = parse_wb_detail_payload(
+                                    b_obj,
+                                    sku=sku,
+                                    currency=api_curr,
+                                    rub_to_byn_rate=rub_to_byn_rate,
+                                )
+                                if parsed_inpage is not None:
+                                    intercepted_card = merge_card_data(intercepted_card, parsed_inpage)
+
+                    # Извлекаем данные напрямую из отрендеренного DOM главной карточки товара (исключая карусели рекомендаций)
+                    dom_info = None
+                    with suppress(Exception):
+                        dom_info = await nav_page.evaluate(
+                            """() => {
+                                const isInsideCarousel = (el) => {
+                                    if (!el) return true;
+                                    return Boolean(
+                                        el.closest(
+                                            '.product-card, .j-card-item, .goods-card, .custom-slider, .swiper-wrapper .product-card, [class*="recommend"], [class*="similar"]'
+                                        )
+                                    );
+                                };
+                                const firstText = (selectors) => {
+                                    for (const sel of selectors) {
+                                        const nodes = document.querySelectorAll(sel);
+                                        for (const n of nodes) {
+                                            if (!isInsideCarousel(n)) {
+                                                const t = (n.innerText || n.textContent || '').trim();
+                                                if (t) return t;
+                                            }
+                                        }
+                                    }
+                                    return '';
+                                };
+
+                                const title = firstText([
+                                    'h1.product-page__title',
+                                    '[class*="productPage"] h1',
+                                    '[data-link*="imt_name"]',
+                                    'h1'
+                                ]);
+                                const brand = firstText([
+                                    '.product-page__header-brand',
+                                    'a.product-page__header-brand',
+                                    '[class*="productHeaderBrand"]',
+                                    '[class*="brandName"]'
+                                ]);
+                                const walletPrice = firstText([
+                                    '.product-page .price-block__wallet-price',
+                                    '.price-block__wallet-price',
+                                    '[class*="priceBlockWalletPrice"]',
+                                    '[class*="walletPrice"]'
+                                ]);
+                                const finalPrice = firstText([
+                                    '.product-page ins.price-block__final-price',
+                                    '.product-page .price-block__final-price',
+                                    'ins.price-block__final-price',
+                                    '.price-block__final-price',
+                                    '[class*="priceBlockFinalPrice"]'
+                                ]);
+                                const oldPrice = firstText([
+                                    '.product-page del.price-block__old-price',
+                                    'del.price-block__old-price',
+                                    '.price-block__old-price',
+                                    '[class*="priceBlockOldPrice"]'
+                                ]);
+                                const soldOutText = firstText([
+                                    '.sold-out-product',
+                                    '.price-block__sold-out',
+                                    '[class*="soldOutProduct"]',
+                                    '[class*="soldOut"]'
+                                ]);
+
+                                let hasAddToCart = false;
+                                const btnSelectors = [
+                                    '.product-page .order__button',
+                                    'button.order__button',
+                                    '[class*="orderButton"]',
+                                    'button[aria-label*="корзин"]',
+                                    'button'
+                                ];
+                                for (const sel of btnSelectors) {
+                                    for (const b of document.querySelectorAll(sel)) {
+                                        if (isInsideCarousel(b)) continue;
+                                        const bt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                                        if (bt.includes('в корзину') || bt.includes('добавить в корзину') || bt.includes('купить сейчас')) {
+                                            hasAddToCart = true;
+                                            break;
+                                        }
+                                    }
+                                    if (hasAddToCart) break;
+                                }
+
+                                let imgSrc = '';
+                                const imgNodes = document.querySelectorAll(
+                                    '.photo-zoom__preview, .slide__content img, img[src*="/images/big/"], img[src*="wbbasket.ru"]'
+                                );
+                                for (const img of imgNodes) {
+                                    if (isInsideCarousel(img)) continue;
+                                    const s = img.currentSrc || img.src || '';
+                                    if (s && s.startsWith('http')) {
+                                        imgSrc = s;
+                                        break;
+                                    }
+                                }
+
+                                const ratingText = firstText([
+                                    '.product-review__rating',
+                                    '[class*="productReviewRating"]',
+                                    '[class*="ratingValue"]'
+                                ]);
+                                const reviewsText = firstText([
+                                    '.product-review__count-review',
+                                    '[class*="productReviewCount"]',
+                                    '[class*="reviewsCount"]'
+                                ]);
+
+                                const mainArea = document.querySelector('.product-page, main, body');
+                                const mainTxt = (mainArea ? mainArea.innerText : '').slice(0, 15000).toLowerCase();
+                                const isNotFound = (
+                                    mainTxt.includes('по вашему запросу ничего не найдено') ||
+                                    mainTxt.includes('страница не найдена') ||
+                                    mainTxt.includes('ошибка 404')
+                                );
+
+                                return {
+                                    title,
+                                    brand,
+                                    priceText: walletPrice || finalPrice,
+                                    finalPriceText: finalPrice,
+                                    oldPriceText: oldPrice,
+                                    soldOutText,
+                                    hasAddToCart,
+                                    imgSrc,
+                                    ratingText,
+                                    reviewsText,
+                                    isNotFound
+                                };
+                            }"""
+                        )
+
+                    dom_card: ProductCardData | None = None
+                    if isinstance(dom_info, dict):
+                        if dom_info.get("isNotFound"):
+                            cookies = await self._export_cookies()
+                            return ProductCardData(in_stock=False), cookies
+
+                        d_title = str(dom_info.get("title") or "").strip()
+                        d_brand = str(dom_info.get("brand") or "").strip()
+                        d_price_raw = str(dom_info.get("priceText") or dom_info.get("finalPriceText") or "").strip()
+                        d_old_raw = str(dom_info.get("oldPriceText") or "").strip()
+                        d_sold_out = str(dom_info.get("soldOutText") or "").strip().lower()
+                        has_cart_btn = bool(dom_info.get("hasAddToCart"))
+                        d_img = normalize_image_url(dom_info.get("imgSrc"))
+
+                        if d_img:
+                            m_b = WB_BASKET_HOST_IN_URL_RE.search(d_img)
+                            if m_b:
+                                WB_BASKET_VOL_CACHE[int(m_b.group(2))] = m_b.group(1).lower()
+
+                        p_val, p_curr = parse_price_value_and_currency(d_price_raw, default_currency=default_currency)
+                        p_byn = convert_to_byn(p_val, p_curr, rub_to_byn_rate)
+
+                        old_val, old_curr = parse_price_value_and_currency(d_old_raw, default_currency=default_currency)
+                        old_byn = convert_to_byn(old_val, old_curr, rub_to_byn_rate)
+
+                        d_rating = None
+                        with suppress(TypeError, ValueError):
+                            r_m = re.search(r"(\d(?:[.,]\d)?)", str(dom_info.get("ratingText") or ""))
+                            if r_m:
+                                d_rating = float(r_m.group(1).replace(",", "."))
+
+                        d_reviews = None
+                        with suppress(TypeError, ValueError):
+                            rv_digits = re.sub(r"\D+", "", str(dom_info.get("reviewsText") or ""))
+                            if rv_digits:
+                                d_reviews = int(rv_digits)
+
+                        if p_byn is not None and p_byn > 0:
+                            d_in_stock: bool | None = True
+                        elif has_cart_btn:
+                            d_in_stock = True
+                        elif d_sold_out and any(m in d_sold_out for m in OUT_OF_STOCK_MARKERS):
+                            d_in_stock = False
+                        else:
+                            d_in_stock = None
+
+                        if d_title or p_byn is not None or d_in_stock is not None or d_img:
+                            dom_card = ProductCardData(
+                                title=clean_product_title(d_title, d_brand),
+                                brand=d_brand,
+                                price_byn=p_byn if d_in_stock is not False else None,
+                                old_price_byn=old_byn if d_in_stock is not False else None,
+                                image_url=d_img,
+                                in_stock=d_in_stock,
+                                rating=d_rating,
+                                reviews_count=d_reviews,
+                                raw_currency=default_currency,
+                            )
+
+                    html_content = await nav_page.content()
+                    html_card = parse_html_product_card(
+                        html_content,
+                        default_currency=default_currency,
+                        rub_to_byn_rate=rub_to_byn_rate,
+                    )
+
+                    extras_card = ProductCardData(
+                        title=intercepted_basket_title,
+                        brand=intercepted_basket_brand,
+                        price_byn=intercepted_latest_byn if (intercepted_card is None or intercepted_card.price_byn is None) else None,
+                        avg_month_price_byn=intercepted_avg_byn,
+                        image_url=intercepted_img_url,
+                    )
+
+                    combined = merge_card_data(intercepted_card, dom_card)
+                    combined = merge_card_data(combined, html_card)
+                    combined = merge_card_data(combined, extras_card)
+
+                    if combined and (
+                        combined.in_stock is False
+                        or (combined.title and combined.price_byn is not None)
+                    ):
+                        cookies = await self._export_cookies()
+                        log(
+                            f"Карточка Wildberries {sku} получена через браузер ({host}): "
+                            f"in_stock={combined.in_stock}, price={combined.price_byn} BYN, "
+                            f"avg={combined.avg_month_price_byn} BYN"
+                        )
+                        return combined, cookies
+                except Exception as exc:
+                    log(f"Ошибка чтения карточки Wildberries {sku} в браузере ({host}): {exc}", logging.DEBUG)
+                finally:
+                    with suppress(Exception):
+                        await nav_page.close()
+
+            cookies = await self._export_cookies()
+            return intercepted_card, cookies
+
     async def _export_cookies(self) -> list[dict]:
         if self._context is None:
             return []
@@ -2938,29 +3573,36 @@ class ParserApp:
             return self._rub_to_byn_rate
 
     def _sync_cookies_to_http_clients(self, cookies: list[dict]) -> None:
-        """Переносит антибот-cookies (abt_data, __Secure-ab-group, xcid, rfuid) из браузера в curl_cffi и aiohttp."""
+        """Переносит антибот-cookies (Ozon abt_data и Wildberries x_wbaas_token/_wbauid) из браузера в curl_cffi и aiohttp."""
         if not cookies:
             return
         synced = 0
         for cookie in cookies:
             name = cookie.get("name")
             value = cookie.get("value")
-            domain = (cookie.get("domain") or "").lstrip(".")
+            domain = (cookie.get("domain") or "").lstrip(".").lower()
             if not name or value is None:
                 continue
             synced += 1
+            is_wb_cookie = any(w in domain for w in ("wildberries", "wb.ru")) or name.startswith(
+                ("x_wbaas", "_wb", "___wb", "wbx")
+            )
+            target_domains = WB_COOKIE_DOMAINS if is_wb_cookie else OZON_DOMAINS
+
             if self.curl_session is not None:
-                with suppress(Exception):
-                    self.curl_session.cookies.set(name, value, domain=domain or "ozon.by")
-                for oz_domain in OZON_DOMAINS:
+                if domain:
                     with suppress(Exception):
-                        self.curl_session.cookies.set(name, value, domain=oz_domain)
+                        self.curl_session.cookies.set(name, value, domain=domain)
+                for t_domain in target_domains:
+                    with suppress(Exception):
+                        self.curl_session.cookies.set(name, value, domain=t_domain)
             if self.http_session is not None:
-                for oz_domain in OZON_DOMAINS:
+                for t_domain in target_domains:
                     with suppress(Exception):
+                        prefix = "https://" if t_domain.count(".") >= 2 else "https://www."
                         self.http_session.cookie_jar.update_cookies(
                             {name: value},
-                            response_url=aiohttp.client.URL(f"https://www.{oz_domain}/"),
+                            response_url=aiohttp.client.URL(f"{prefix}{t_domain}/"),
                         )
         if synced:
             self.synced_cookie_count = synced
@@ -2975,13 +3617,42 @@ class ParserApp:
                     env_list.append({"name": k.strip(), "value": v.strip(), "domain": "ozon.by"})
             self._sync_cookies_to_http_clients(env_list)
 
+        raw_wb_cookies = os.getenv("WB_COOKIES", "").strip()
+        if raw_wb_cookies:
+            wb_list: list[dict] = []
+            for part in raw_wb_cookies.split(";"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    wb_list.append({"name": k.strip(), "value": v.strip(), "domain": "wildberries.by"})
+            self._sync_cookies_to_http_clients(wb_list)
+
         if os.path.isfile(self.settings.cookies_cache_path):
             with suppress(Exception):
                 with open(self.settings.cookies_cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f)
                 if isinstance(cached, list) and cached:
                     self._sync_cookies_to_http_clients(cached)
-                    log(f"Загружено {len(cached)} кэшированных антибот-cookies Ozon с диска")
+                    log(f"Загружено {len(cached)} кэшированных антибот-cookies с диска")
+
+        if os.path.isfile(self.settings.wb_baskets_cache_path):
+            with suppress(Exception):
+                with open(self.settings.wb_baskets_cache_path, "r", encoding="utf-8") as f:
+                    baskets_map = json.load(f)
+                if isinstance(baskets_map, dict):
+                    for k, v in baskets_map.items():
+                        with suppress(TypeError, ValueError):
+                            if isinstance(v, str) and v.endswith((".wbbasket.ru", ".wbcontent.net")):
+                                WB_BASKET_VOL_CACHE[int(k)] = v
+                    if WB_BASKET_VOL_CACHE:
+                        log(f"Загружено {len(WB_BASKET_VOL_CACHE)} закэшированных шардов корзин WB")
+
+    def _save_wb_baskets_cache_to_disk(self) -> None:
+        if not WB_BASKET_VOL_CACHE:
+            return
+        with suppress(OSError):
+            serializable = {str(k): v for k, v in WB_BASKET_VOL_CACHE.items()}
+            with open(self.settings.wb_baskets_cache_path, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False)
 
     async def host_has_only_public_ips(self, hostname: str) -> bool:
         """Дополнительная защита от SSRF; allowlist доменов проверяется отдельно."""
@@ -3007,42 +3678,64 @@ class ParserApp:
             return extracted
         return None
 
-    async def _fetch_json_any(self, url: str, headers: dict[str, str] | None = None) -> Any:
-        """Выполняет GET-запрос и возвращает распарсенный JSON (dict или list) через curl_cffi или aiohttp."""
+    async def _fetch_json_any(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        timeout_override: float | None = None,
+    ) -> Any:
+        """Выполняет GET-запрос и возвращает распарсенный JSON (dict или list) через curl_cffi или aiohttp.
+
+        Если curl_cffi получил явный ответ 403/429/404 от сервера, не дублирует запрос через aiohttp,
+        чтобы не провоцировать каскадный TLS-бан Wildberries/Ozon.
+        """
         req_headers = dict(headers or DEFAULT_HEADERS)
         req_headers.setdefault("Accept", "application/json, text/plain, */*")
+        req_timeout = timeout_override or self.settings.request_timeout_seconds
 
         if self.curl_session is not None:
-            with suppress(Exception):
+            try:
                 async with self.resolve_semaphore:
                     resp = await self.curl_session.get(
                         url,
                         headers=req_headers,
                         allow_redirects=True,
-                        timeout=self.settings.request_timeout_seconds,
+                        timeout=req_timeout,
                     )
-                    if resp.status_code == 404:
-                        return {"_http_status": 404}
+                    if resp.status_code in {403, 404, 429}:
+                        return {"_http_status": resp.status_code}
                     if 200 <= resp.status_code < 300 and resp.content:
                         return json.loads(resp.content.decode("utf-8", errors="ignore"))
+                    return None
+            except Exception:
+                pass
 
         if self.http_session is not None:
             with suppress(Exception):
                 async with self.resolve_semaphore:
+                    client_timeout = aiohttp.ClientTimeout(total=req_timeout)
                     async with self.http_session.get(
                         url,
                         headers=req_headers,
                         allow_redirects=True,
+                        timeout=client_timeout,
                     ) as resp:
-                        if resp.status == 404:
-                            return {"_http_status": 404}
+                        if resp.status in {403, 404, 429}:
+                            return {"_http_status": resp.status}
                         if 200 <= resp.status < 300:
                             raw = await resp.content.read(HEAD_READ_LIMIT)
                             return json.loads(raw.decode("utf-8", errors="ignore"))
         return None
 
-    async def _fetch_json_url(self, url: str, headers: dict[str, str] | None = None) -> dict[str, Any] | None:
-        data = await self._fetch_json_any(url, headers=headers)
+    async def _fetch_json_url(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        timeout_override: float | None = None,
+    ) -> dict[str, Any] | None:
+        data = await self._fetch_json_any(url, headers=headers, timeout_override=timeout_override)
         return data if isinstance(data, dict) else None
 
     async def download_product_image(self, image_url: str) -> io.BytesIO | None:
@@ -3051,68 +3744,127 @@ class ParserApp:
         if not clean_url:
             return None
 
+        candidate_urls = [clean_url]
+        if "wbbasket.ru/" in clean_url or "wbcontent.net/" in clean_url:
+            if clean_url.endswith("/images/big/1.webp"):
+                candidate_urls.append(clean_url[:-5] + ".jpg")
+                candidate_urls.append(clean_url.replace("/images/big/1.webp", "/images/c516x688/1.webp"))
+                candidate_urls.append(clean_url.replace("/images/big/1.webp", "/images/c516x688/1.jpg"))
+
         img_headers = {
             "User-Agent": BROWSER_USER_AGENT,
-            "Accept": "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
+            "Accept": "image/avif,image/webp,image/apng,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
             "Accept-Language": "ru-RU,ru;q=0.9",
         }
 
-        if self.curl_session is not None:
-            with suppress(Exception):
-                async with self.resolve_semaphore:
-                    resp = await self.curl_session.get(
-                        clean_url,
-                        headers=img_headers,
-                        allow_redirects=True,
-                        timeout=self.settings.request_timeout_seconds,
-                    )
-                    if 200 <= resp.status_code < 300 and resp.content:
-                        converted = await asyncio.to_thread(
-                            convert_image_bytes_to_jpeg,
-                            resp.content[:IMAGE_READ_LIMIT],
+        for target_url in candidate_urls:
+            if self.curl_session is not None:
+                with suppress(Exception):
+                    async with self.resolve_semaphore:
+                        resp = await self.curl_session.get(
+                            target_url,
+                            headers=img_headers,
+                            allow_redirects=True,
+                            timeout=self.settings.request_timeout_seconds,
                         )
-                        if converted is not None:
-                            return converted
-
-        if self.http_session is not None:
-            with suppress(Exception):
-                async with self.resolve_semaphore:
-                    async with self.http_session.get(
-                        clean_url,
-                        headers=img_headers,
-                        allow_redirects=True,
-                    ) as resp:
-                        if 200 <= resp.status < 300:
-                            raw = await resp.content.read(IMAGE_READ_LIMIT)
-                            converted = await asyncio.to_thread(convert_image_bytes_to_jpeg, raw)
+                        if 200 <= resp.status_code < 300 and resp.content:
+                            converted = await asyncio.to_thread(
+                                convert_image_bytes_to_jpeg,
+                                resp.content[:IMAGE_READ_LIMIT],
+                            )
                             if converted is not None:
                                 return converted
+                        if resp.status_code == 404:
+                            continue
+
+            if self.http_session is not None:
+                with suppress(Exception):
+                    async with self.resolve_semaphore:
+                        async with self.http_session.get(
+                            target_url,
+                            headers=img_headers,
+                            allow_redirects=True,
+                        ) as resp:
+                            if 200 <= resp.status < 300:
+                                raw = await resp.content.read(IMAGE_READ_LIMIT)
+                                converted = await asyncio.to_thread(convert_image_bytes_to_jpeg, raw)
+                                if converted is not None:
+                                    return converted
 
         return None
+
+    async def _resolve_wb_basket_host(
+        self,
+        sku_int: int,
+        req_headers: dict[str, str],
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Определяет рабочий шард basket-XX.wbbasket.ru для артикула WB и возвращает (basket_host, card_json).
+
+        Если расчётный шард возвращает 404 (например, для новых 9- и 10-значных артикулов),
+        выполняет быстрый параллельный пробинг соседних шардов и кэширует найденный хост для vol.
+        """
+        vol = sku_int // 100_000
+        part = sku_int // 1_000
+        candidates = get_wb_candidate_basket_hosts(vol)
+
+        # 1. Проверяем первый (кэшированный или расчётный) хост
+        primary_host = candidates[0]
+        primary_url = f"https://{primary_host}/vol{vol}/part{part}/{sku_int}/info/ru/card.json"
+        card_data = await self._fetch_json_url(primary_url, headers=req_headers, timeout_override=4.0)
+        if isinstance(card_data, dict) and "_http_status" not in card_data and (
+            card_data.get("imt_name") or card_data.get("subj_name") or card_data.get("nm_id") or card_data.get("imt_id")
+        ):
+            if WB_BASKET_VOL_CACHE.get(vol) != primary_host:
+                WB_BASKET_VOL_CACHE[vol] = primary_host
+                self._save_wb_baskets_cache_to_disk()
+            return primary_host, card_data
+
+        # 2. Если расчётный баскет вернул 404 / пусто, пробируем остальные шарды батчами по 10
+        remaining = candidates[1:]
+        batch_size = 10
+        for i in range(0, len(remaining), batch_size):
+            batch = remaining[i:i + batch_size]
+
+            async def _probe_host(host: str) -> tuple[str, dict[str, Any] | None]:
+                u = f"https://{host}/vol{vol}/part{part}/{sku_int}/info/ru/card.json"
+                res = await self._fetch_json_url(u, headers=req_headers, timeout_override=3.2)
+                if isinstance(res, dict) and "_http_status" not in res and (
+                    res.get("imt_name") or res.get("subj_name") or res.get("nm_id") or res.get("imt_id")
+                ):
+                    return host, res
+                return host, None
+
+            results = await asyncio.gather(*(_probe_host(h) for h in batch), return_exceptions=True)
+            for item in results:
+                if isinstance(item, tuple) and item[1] is not None:
+                    found_host, found_card = item
+                    WB_BASKET_VOL_CACHE[vol] = found_host
+                    self._save_wb_baskets_cache_to_disk()
+                    log(f"Найден рабочий шард корзины WB для vol={vol} (арт. {sku_int}): {found_host}")
+                    return found_host, found_card
+
+        return primary_host, None
 
     async def _fetch_wb_basket_card_extras(
         self,
         sku: str,
         *,
         rub_to_byn_rate: float = 0.0345,
-    ) -> tuple[str, str, float | None, str]:
-        """Получает с сервера корзины Wildberries:
+    ) -> tuple[str, str, float | None, float | None, str, float | None, int | None, bool]:
+        """Получает с сервера корзины Wildberries (basket-XX.wbbasket.ru):
         - полное название и бренд (info/ru/card.json)
-        - среднюю цену за месяц (info/price-history.json)
+        - среднюю цену за месяц и последнюю известную цену (info/price-history.json)
         - ссылку на главное фото карточки товара (images/big/1.webp)
+        - рейтинг и число отзывов через публичный CDN отзывов (feedbacks1/2.wb.ru) при наличии imt_id
+        - флаг card_exists (подтверждение существования карточки товара на CDN)
         """
         try:
             sku_int = int(sku)
         except ValueError:
-            return "", "", None, ""
+            return "", "", None, None, "", None, None, False
 
         vol = sku_int // 100_000
         part = sku_int // 1_000
-        basket_host = get_wb_basket_host(vol)
-        base_path = f"https://{basket_host}/vol{vol}/part{part}/{sku_int}"
-        card_json_url = f"{base_path}/info/ru/card.json"
-        history_json_url = f"{base_path}/info/price-history.json"
-        image_url = f"{base_path}/images/big/1.webp"
 
         req_headers = {
             "User-Agent": BROWSER_USER_AGENT,
@@ -3121,15 +3873,21 @@ class ParserApp:
             "Referer": f"https://www.wildberries.by/catalog/{sku_int}/detail.aspx",
         }
 
-        card_data, history_data = await asyncio.gather(
-            self._fetch_json_url(card_json_url, headers=req_headers),
-            self._fetch_json_any(history_json_url, headers=req_headers),
-            return_exceptions=True,
-        )
+        basket_host, card_data = await self._resolve_wb_basket_host(sku_int, req_headers)
+        base_path = f"https://{basket_host}/vol{vol}/part{part}/{sku_int}"
+        history_json_url = f"{base_path}/info/price-history.json"
+        image_url = f"{base_path}/images/big/1.webp"
+
+        history_data = await self._fetch_json_any(history_json_url, headers=req_headers, timeout_override=4.0)
 
         title = ""
         brand_name = ""
-        if isinstance(card_data, dict) and card_data.get("_http_status") != 404:
+        imt_id = None
+        card_exists = False
+
+        if isinstance(card_data, dict) and "_http_status" not in card_data:
+            card_exists = True
+            imt_id = card_data.get("imt_id")
             imt_name = str(card_data.get("imt_name") or card_data.get("subj_name") or "").strip()
             selling = card_data.get("selling")
             if isinstance(selling, dict):
@@ -3139,84 +3897,287 @@ class ParserApp:
             title = clean_product_title(imt_name, brand_name)
 
         avg_month_price_byn = None
+        latest_history_price_byn = None
         if isinstance(history_data, list):
             avg_month_price_byn = parse_wb_price_history_avg(
                 history_data,
                 rub_to_byn_rate=rub_to_byn_rate,
             )
+            latest_history_price_byn = parse_wb_price_history_latest(
+                history_data,
+                rub_to_byn_rate=rub_to_byn_rate,
+            )
 
-        return title, brand_name, avg_month_price_byn, image_url
+        rating: float | None = None
+        reviews_count: int | None = None
+        if imt_id:
+            for fb_host in ("feedbacks1.wb.ru", "feedbacks2.wb.ru"):
+                fb_url = f"https://{fb_host}/feedbacks/v2/{imt_id}"
+                fb_data = await self._fetch_json_url(fb_url, headers=req_headers, timeout_override=3.5)
+                if isinstance(fb_data, dict) and "_http_status" not in fb_data:
+                    with suppress(TypeError, ValueError):
+                        val = fb_data.get("valuation")
+                        if val is not None and float(val) > 0:
+                            rating = float(val)
+                    with suppress(TypeError, ValueError):
+                        cnt = fb_data.get("feedbackCount") or fb_data.get("feedbackCountWithText")
+                        if cnt is not None and int(cnt) >= 0:
+                            reviews_count = int(cnt)
+                    if rating is not None or reviews_count is not None:
+                        break
 
-    async def fetch_wb_card_data(self, sku: str, messages: Iterable = ()) -> ProductCardData | None:
-        """Парсит карточку товара Wildberries: название, актуальная цена в BYN, средняя цена за месяц, фото и наличие."""
+        return (
+            title,
+            brand_name,
+            avg_month_price_byn,
+            latest_history_price_byn,
+            image_url,
+            rating,
+            reviews_count,
+            card_exists,
+        )
+
+    async def fetch_wb_card_data(
+        self,
+        sku: str,
+        messages: Iterable = (),
+        source_text: str = "",
+    ) -> ProductCardData | None:
+        """Парсит карточку товара Wildberries: название, актуальная цена в BYN, средняя цена за месяц, фото и наличие.
+
+        Использует многоуровневый каскад:
+        1. CDN корзины WB (динамический поиск basket-XX.wbbasket.ru, card.json, price-history.json, feedbacks).
+        2. Прямые и внутренние JSON API карточек (card.wb.ru v4/v2, __internal/card/cards/v4/detail, u-card.wb.ru)
+           по регионам Беларуси и РФ без преждевременного обрыва цикла при региональном отсутствии.
+        3. Поисковый индекс WB (search.wb.ru/exactmatch/ru/{shard}/v18/search и v9/search по артикулу).
+        4. Браузерный резолвер Playwright (перехват XHR + чтение DOM страницы wildberries.by / wildberries.ru).
+        5. Telegram WebPage-превью (GetWebPageRequest + медиа сообщения).
+        6. Резервная цена из истории цен WB (price-history.json) или текста исходного поста, если API цен закрыт 403.
+        """
         rub_rate = await self.get_rub_to_byn_rate()
         wb_headers = {
             "User-Agent": BROWSER_USER_AGENT,
-            "Accept": "*/*",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ru-RU,ru;q=0.9",
             "Origin": "https://www.wildberries.by",
             "Referer": f"https://www.wildberries.by/catalog/{sku}/detail.aspx",
+            "x-requested-with": "XMLHttpRequest",
         }
 
-        dest_candidates = (self.settings.wb_dest_byn, -59208, -59202, -1257786)
-        unique_dests = list(dict.fromkeys(dest_candidates))
+        # 1. Сразу получаем открытые данные с Basket CDN (название, бренд, историю цен, фото, рейтинг)
+        (
+            basket_title,
+            basket_brand,
+            avg_month_byn,
+            latest_history_byn,
+            basket_img,
+            basket_rating,
+            basket_reviews,
+            card_exists,
+        ) = await self._fetch_wb_basket_card_extras(
+            sku,
+            rub_to_byn_rate=rub_rate,
+        )
 
         card_data: ProductCardData | None = None
-
-        for api_ver in ("v2", "v4", "v1"):
-            for dest in unique_dests:
-                detail_url = (
-                    f"https://card.wb.ru/cards/{api_ver}/detail"
-                    f"?appType=1&curr=byn&dest={dest}&spp={self.settings.wb_spp}&nm={sku}"
-                )
-                payload = await self._fetch_json_url(detail_url, headers=wb_headers)
-                if not payload or payload.get("_http_status") == 404:
-                    continue
-                parsed = parse_wb_detail_payload(
-                    payload,
-                    currency="BYN",
-                    rub_to_byn_rate=rub_rate,
-                )
-                if parsed is not None:
-                    card_data = merge_card_data(card_data, parsed)
-                    if card_data.in_stock is False or (card_data.title and card_data.price_byn is not None):
-                        break
-            if card_data and (card_data.in_stock is False or (card_data.title and card_data.price_byn is not None)):
-                break
-
-        if card_data is None or (card_data.in_stock is not False and card_data.price_byn is None):
-            rub_url = (
-                f"https://card.wb.ru/cards/v2/detail"
-                f"?appType=1&curr=rub&dest=-1257786&spp={self.settings.wb_spp}&nm={sku}"
-            )
-            payload_rub = await self._fetch_json_url(rub_url, headers=wb_headers)
-            if payload_rub and payload_rub.get("_http_status") != 404:
-                parsed_rub = parse_wb_detail_payload(
-                    payload_rub,
-                    currency="RUB",
-                    rub_to_byn_rate=rub_rate,
-                )
-                card_data = merge_card_data(card_data, parsed_rub)
-
-        # Если товар в наличии, подтягиваем среднюю цену за месяц, полное имя и фото с сервера корзины WB
-        if card_data is None or card_data.in_stock is not False:
-            basket_title, basket_brand, avg_month_byn, basket_img = await self._fetch_wb_basket_card_extras(
-                sku,
-                rub_to_byn_rate=rub_rate,
-            )
-            extras_card = ProductCardData(
+        if basket_title or basket_img or avg_month_byn is not None:
+            card_data = ProductCardData(
                 title=basket_title,
                 brand=basket_brand,
                 avg_month_price_byn=avg_month_byn,
                 image_url=basket_img,
+                rating=basket_rating,
+                reviews_count=basket_reviews,
             )
-            card_data = merge_card_data(card_data, extras_card)
 
-        if card_data is None or (card_data.in_stock is not False and (not card_data.title or card_data.price_byn is None)):
-            wp_obj = match_message_webpage_obj(messages, "", sku, 1)
-            if wp_obj:
-                wp_card = parse_webpage_preview_card(wp_obj, default_currency="BYN", rub_to_byn_rate=rub_rate)
+        # 2. Опрашиваем JSON API карточек (v4 / v2) на всех хостах и регионах (BYN и RUB)
+        dest_candidates = (self.settings.wb_dest_byn, -59208, -59202, -1257786)
+        unique_dests = list(dict.fromkeys(dest_candidates))
+
+        api_hosts = (
+            ("https://card.wb.ru/cards/v4/detail", "https://www.wildberries.by"),
+            ("https://card.wb.ru/cards/v2/detail", "https://www.wildberries.by"),
+            ("https://www.wildberries.by/__internal/card/cards/v4/detail", "https://www.wildberries.by"),
+            ("https://www.wildberries.ru/__internal/card/cards/v4/detail", "https://www.wildberries.ru"),
+            ("https://u-card.wb.ru/cards/v4/detail", "https://www.wildberries.by"),
+        )
+
+        explicit_oos_responses = 0
+        successful_api_responses = 0
+        blocked_hosts: set[str] = set()
+
+        for base_endpoint, origin_url in api_hosts:
+            host_key = urlparse(base_endpoint).netloc
+            if host_key in blocked_hosts:
+                continue
+
+            headers = dict(wb_headers)
+            headers["Origin"] = origin_url
+            headers["Referer"] = f"{origin_url}/catalog/{sku}/detail.aspx"
+
+            for dest in unique_dests:
+                detail_url = (
+                    f"{base_endpoint}"
+                    f"?appType=1&curr=byn&dest={dest}&spp={self.settings.wb_spp}&nm={sku}"
+                )
+                payload = await self._fetch_json_url(detail_url, headers=headers, timeout_override=5.0)
+                if not payload:
+                    continue
+                http_status = payload.get("_http_status")
+                if http_status in {403, 429, 404}:
+                    if http_status in {403, 429}:
+                        blocked_hosts.add(host_key)
+                    break
+
+                parsed = parse_wb_detail_payload(
+                    payload,
+                    sku=sku,
+                    currency="BYN",
+                    rub_to_byn_rate=rub_rate,
+                )
+                if parsed is not None:
+                    successful_api_responses += 1
+                    if parsed.in_stock is False:
+                        explicit_oos_responses += 1
+                    else:
+                        card_data = merge_card_data(parsed, card_data)
+                        if card_data and card_data.title and card_data.price_byn is not None:
+                            return card_data
+
+            if card_data and card_data.title and card_data.price_byn is not None:
+                return card_data
+
+            # Пробуем также RUB-витрину (Москва -1257786 и 123585595), если для BYN цены не оказалось
+            if host_key not in blocked_hosts:
+                for rub_dest in (-1257786, 123585595):
+                    rub_url = (
+                        f"{base_endpoint}"
+                        f"?appType=1&curr=rub&dest={rub_dest}&spp={self.settings.wb_spp}&nm={sku}"
+                    )
+                    payload_rub = await self._fetch_json_url(rub_url, headers=headers, timeout_override=5.0)
+                    if not payload_rub:
+                        continue
+                    if payload_rub.get("_http_status") in {403, 429, 404}:
+                        if payload_rub.get("_http_status") in {403, 429}:
+                            blocked_hosts.add(host_key)
+                        break
+                    parsed_rub = parse_wb_detail_payload(
+                        payload_rub,
+                        sku=sku,
+                        currency="RUB",
+                        rub_to_byn_rate=rub_rate,
+                    )
+                    if parsed_rub is not None:
+                        successful_api_responses += 1
+                        if parsed_rub.in_stock is False:
+                            explicit_oos_responses += 1
+                        else:
+                            card_data = merge_card_data(parsed_rub, card_data)
+                            if card_data and card_data.title and card_data.price_byn is not None:
+                                return card_data
+
+        # 3. Пробуем поисковый API WB (search.wb.ru/exactmatch/ru/{shard}/v18/search и v9/search) по артикулу
+        if card_data is None or card_data.price_byn is None:
+            search_shards = ("common", "preset", "msk")
+            search_blocked = False
+            for api_v in ("v18", "v9"):
+                if search_blocked:
+                    break
+                for shard in search_shards:
+                    for curr_code, s_dest in (("byn", self.settings.wb_dest_byn), ("rub", -1257786)):
+                        search_url = (
+                            f"https://search.wb.ru/exactmatch/ru/{shard}/{api_v}/search"
+                            f"?appType=1&curr={curr_code}&dest={s_dest}&page=1&query={sku}"
+                            f"&resultset=catalog&sort=popular&spp={self.settings.wb_spp}"
+                        )
+                        s_payload = await self._fetch_json_url(search_url, headers=wb_headers, timeout_override=5.0)
+                        if not s_payload:
+                            continue
+                        s_status = s_payload.get("_http_status")
+                        if s_status == 403:
+                            search_blocked = True
+                            break
+                        if s_status in {429, 404}:
+                            continue
+                        parsed_search = parse_wb_detail_payload(
+                            s_payload,
+                            sku=sku,
+                            currency=curr_code.upper(),
+                            rub_to_byn_rate=rub_rate,
+                        )
+                        if parsed_search is not None and parsed_search.price_byn is not None:
+                            card_data = merge_card_data(parsed_search, card_data)
+                            if card_data and card_data.title and card_data.price_byn is not None:
+                                return card_data
+
+        # Если API карточек успешно ответили (HTTP 200) на нескольких регионах и везде подтвердили отсутствие товара
+        if successful_api_responses >= 2 and explicit_oos_responses == successful_api_responses and (
+            card_data is None or card_data.price_byn is None
+        ):
+            return replace(card_data, in_stock=False, price_byn=None) if card_data else ProductCardData(in_stock=False)
+
+        # 4. Браузерный резолвер Playwright (обходит блокировку 403 на card.wb.ru и читает живой DOM карточки WB)
+        if self.browser_resolver.is_available and (card_data is None or card_data.price_byn is None):
+            browser_card, fresh_cookies = await self.browser_resolver.fetch_wb_product_card(
+                sku,
+                rub_to_byn_rate=rub_rate,
+            )
+            if fresh_cookies:
+                self._sync_cookies_to_http_clients(fresh_cookies)
+            if browser_card is not None:
+                if browser_card.in_stock is False and (card_data is None or card_data.price_byn is None):
+                    return replace(
+                        merge_card_data(card_data, browser_card),
+                        in_stock=False,
+                        price_byn=None,
+                    )
+                card_data = merge_card_data(browser_card, card_data)
+                if card_data and card_data.title and card_data.price_byn is not None:
+                    return card_data
+
+        # 5. Проверяем Telegram GetWebPageRequest и WebPage-превью исходного сообщения
+        if self.user_client.is_connected() and "GetWebPageRequest" in globals() and (
+            card_data is None or not card_data.title or card_data.price_byn is None
+        ):
+            for wb_host, def_curr in (("www.wildberries.by", "BYN"), ("www.wildberries.ru", "RUB")):
+                target_url = f"https://{wb_host}/catalog/{sku}/detail.aspx"
+                with suppress(Exception):
+                    res = await self.user_client(GetWebPageRequest(url=target_url, hash=0))
+                    webpage = getattr(res, "webpage", res)
+                    wp_card = parse_webpage_preview_card(
+                        webpage,
+                        default_currency=def_curr,
+                        rub_to_byn_rate=rub_rate,
+                    )
+                    if wp_card is not None:
+                        if wp_card.in_stock is False and (card_data is None or card_data.price_byn is None):
+                            return replace(merge_card_data(card_data, wp_card), in_stock=False, price_byn=None)
+                        card_data = merge_card_data(card_data, wp_card)
+                        if card_data and card_data.title and card_data.price_byn is not None:
+                            return card_data
+
+        wp_obj = match_message_webpage_obj(messages, "", sku, 1)
+        if wp_obj:
+            wp_card = parse_webpage_preview_card(wp_obj, default_currency="BYN", rub_to_byn_rate=rub_rate)
+            if wp_card is not None:
+                if wp_card.in_stock is False and (card_data is None or card_data.price_byn is None):
+                    return replace(merge_card_data(card_data, wp_card), in_stock=False, price_byn=None)
                 card_data = merge_card_data(card_data, wp_card)
+
+        # 6. Если живой эндпоинт цен закрыт антиботом (403), но карточка существует и не помечена как «нет в наличии»:
+        # используем последнюю известную цену из price-history.json или цену из текста поста
+        if card_data is not None and card_data.in_stock is not False and card_data.price_byn is None:
+            fallback_price = latest_history_byn
+            if fallback_price is None and source_text:
+                fallback_price = extract_price_from_post_text(source_text, rub_to_byn_rate=rub_rate)
+            if fallback_price is not None and fallback_price > 0:
+                log(
+                    f"Для товара Wildberries (арт. {sku}) использована резервная цена {fallback_price} BYN "
+                    f"(история цен / текст поста)"
+                )
+                card_data = replace(card_data, price_byn=fallback_price, in_stock=True)
+            elif card_exists and card_data.title:
+                card_data = replace(card_data, in_stock=True)
 
         return card_data
 
@@ -3356,6 +4317,7 @@ class ParserApp:
         self,
         product: ProductInfo,
         messages: Iterable = (),
+        source_text: str = "",
     ) -> ProductInfo | None:
         """Загружает карточку товара, проверяет наличие и обогащает ProductInfo названием, ценой в BYN, средней ценой и фото.
 
@@ -3365,7 +4327,11 @@ class ParserApp:
             return None if self.settings.require_sku else product
 
         if product.platform == "Wildberries":
-            card = await self.fetch_wb_card_data(product.sku, messages=messages)
+            card = await self.fetch_wb_card_data(
+                product.sku,
+                messages=messages,
+                source_text=source_text,
+            )
         else:
             card = await self.fetch_ozon_card_data(
                 product.sku,
@@ -3382,11 +4348,24 @@ class ParserApp:
                 return None
 
         if self.settings.require_price and (card is None or card.price_byn is None or card.price_byn <= 0):
-            log(
-                f"Для товара {product.platform} (арт. {product.sku}) не найдена актуальная цена / нет в наличии — "
-                f"публикация отменена"
-            )
-            return None
+            # Если для Wildberries публичный API цен заблокирован (403), но карточка товара подтверждена на CDN/в браузере
+            # и товар не числится отсутствующим, публикуем карточку без строки цены вместо ложной отмены
+            if (
+                product.platform == "Wildberries"
+                and card is not None
+                and card.in_stock is True
+                and (card.title or product.title)
+            ):
+                log(
+                    f"Для товара Wildberries (арт. {product.sku}) API цен временно недоступен, "
+                    f"но карточка активна — публикуем без указания цены"
+                )
+            else:
+                log(
+                    f"Для товара {product.platform} (арт. {product.sku}) не найдена актуальная цена / нет в наличии — "
+                    f"публикация отменена"
+                )
+                return None
 
         if card is None:
             return product
@@ -3584,7 +4563,7 @@ class ParserApp:
 
         clean_url = strip_antibot_params(url)
         host = normalize_host(urlparse(clean_url).hostname)
-        if not is_ozon_host(host):
+        if not (is_ozon_host(host) or is_wb_host(host)):
             return clean_url
 
         if prefetched_body:
@@ -3980,7 +4959,14 @@ class ParserApp:
 
         # Парсим карточки только для новых (не публиковавшихся ранее) товаров
         enriched_results = await asyncio.gather(
-            *(self.enrich_product_with_card(product, messages=job.messages) for product in fresh_candidates),
+            *(
+                self.enrich_product_with_card(
+                    product,
+                    messages=job.messages,
+                    source_text=source_text if len(fresh_candidates) == 1 else "",
+                )
+                for product in fresh_candidates
+            ),
             return_exceptions=True,
         )
 
