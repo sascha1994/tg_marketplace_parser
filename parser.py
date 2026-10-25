@@ -667,41 +667,47 @@ class ParserState:
 
 
 class DuplicateDB:
-    """SQLite-дедупликация с краткоживущими резервированиями pending."""
+    """SQLite-дедупликация с постоянным соединением и краткоживущими резервированиями pending."""
 
     def __init__(self, db_path: str, cooldown_hours: int, pending_ttl_minutes: int):
         self.db_path = db_path
         self.cooldown_seconds = cooldown_hours * 3600
         self.pending_ttl_seconds = pending_ttl_minutes * 60
+        self._conn = self._connect()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=10,
+            isolation_level=None,
+            check_same_thread=False,
+        )
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
 
     def _init_db(self) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS seen_items (
-                    sku_key TEXT PRIMARY KEY,
-                    platform TEXT NOT NULL,
-                    sku TEXT,
-                    canonical_url TEXT NOT NULL,
-                    source_chat_id INTEGER,
-                    source_message_id INTEGER,
-                    status TEXT NOT NULL CHECK(status IN ('pending', 'published')),
-                    created_at INTEGER NOT NULL,
-                    published_at INTEGER
-                )
-                """
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_items (
+                sku_key TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                sku TEXT,
+                canonical_url TEXT NOT NULL,
+                source_chat_id INTEGER,
+                source_message_id INTEGER,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'published')),
+                created_at INTEGER NOT NULL,
+                published_at INTEGER
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_seen_items_status_time "
-                "ON seen_items(status, published_at, created_at)"
-            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_seen_items_status_time "
+            "ON seen_items(status, published_at, created_at)"
+        )
 
     def reserve_fresh(
         self,
@@ -717,50 +723,49 @@ class DuplicateDB:
         published_cutoff = now - self.cooldown_seconds
         pending_cutoff = now - self.pending_ttl_seconds
 
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    "DELETE FROM seen_items WHERE status = 'published' AND published_at < ?",
-                    (published_cutoff,),
-                )
-                conn.execute(
-                    "DELETE FROM seen_items WHERE status = 'pending' AND created_at < ?",
-                    (pending_cutoff,),
-                )
-                placeholders = ",".join("?" for _ in products_by_key)
-                rows = conn.execute(
-                    f"SELECT sku_key FROM seen_items WHERE sku_key IN ({placeholders})",
-                    tuple(products_by_key),
-                ).fetchall()
-                occupied = {row[0] for row in rows}
-                fresh_keys = set(products_by_key) - occupied
-                conn.executemany(
-                    """
-                    INSERT INTO seen_items (
-                        sku_key, platform, sku, canonical_url, source_chat_id,
-                        source_message_id, status, created_at, published_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
-                    """,
-                    [
-                        (
-                            product.sku_key,
-                            product.platform,
-                            product.sku,
-                            product.canonical_url,
-                            source_chat_id,
-                            source_message_id,
-                            now,
-                        )
-                        for key, product in products_by_key.items()
-                        if key in fresh_keys
-                    ],
-                )
-                conn.execute("COMMIT")
-                return fresh_keys
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "DELETE FROM seen_items WHERE status = 'published' AND published_at < ?",
+                (published_cutoff,),
+            )
+            self._conn.execute(
+                "DELETE FROM seen_items WHERE status = 'pending' AND created_at < ?",
+                (pending_cutoff,),
+            )
+            placeholders = ",".join("?" for _ in products_by_key)
+            rows = self._conn.execute(
+                f"SELECT sku_key FROM seen_items WHERE sku_key IN ({placeholders})",
+                tuple(products_by_key),
+            ).fetchall()
+            occupied = {row[0] for row in rows}
+            fresh_keys = set(products_by_key) - occupied
+            self._conn.executemany(
+                """
+                INSERT INTO seen_items (
+                    sku_key, platform, sku, canonical_url, source_chat_id,
+                    source_message_id, status, created_at, published_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                [
+                    (
+                        product.sku_key,
+                        product.platform,
+                        product.sku,
+                        product.canonical_url,
+                        source_chat_id,
+                        source_message_id,
+                        now,
+                    )
+                    for key, product in products_by_key.items()
+                    if key in fresh_keys
+                ],
+            )
+            self._conn.execute("COMMIT")
+            return fresh_keys
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def mark_published(self, sku_keys: Iterable[str]) -> None:
         keys = tuple(set(sku_keys))
@@ -768,35 +773,35 @@ class DuplicateDB:
             return
         now = int(time.time())
         placeholders = ",".join("?" for _ in keys)
-        with closing(self._connect()) as conn:
-            conn.execute(
-                f"UPDATE seen_items SET status = 'published', published_at = ? "
-                f"WHERE status = 'pending' AND sku_key IN ({placeholders})",
-                (now, *keys),
-            )
+        self._conn.execute(
+            f"UPDATE seen_items SET status = 'published', published_at = ? "
+            f"WHERE status = 'pending' AND sku_key IN ({placeholders})",
+            (now, *keys),
+        )
 
     def release_reservations(self, sku_keys: Iterable[str]) -> None:
         keys = tuple(set(sku_keys))
         if not keys:
             return
         placeholders = ",".join("?" for _ in keys)
-        with closing(self._connect()) as conn:
-            conn.execute(
-                f"DELETE FROM seen_items WHERE status = 'pending' AND sku_key IN ({placeholders})",
-                keys,
-            )
+        self._conn.execute(
+            f"DELETE FROM seen_items WHERE status = 'pending' AND sku_key IN ({placeholders})",
+            keys,
+        )
 
     def clear_published(self) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute("DELETE FROM seen_items")
+        self._conn.execute("DELETE FROM seen_items")
 
     def count_by_status(self) -> tuple[int, int]:
-        with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) FROM seen_items GROUP BY status"
-            ).fetchall()
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) FROM seen_items GROUP BY status"
+        ).fetchall()
         counts = {status: count for status, count in rows}
         return counts.get("published", 0), counts.get("pending", 0)
+
+    def close(self) -> None:
+        with suppress(Exception):
+            self._conn.close()
 
 
 def log(message: str, level: int = logging.INFO) -> None:
@@ -3062,7 +3067,10 @@ class ParserApp:
                         timeout=self.settings.request_timeout_seconds,
                     )
                     if 200 <= resp.status_code < 300 and resp.content:
-                        converted = convert_image_bytes_to_jpeg(resp.content[:IMAGE_READ_LIMIT])
+                        converted = await asyncio.to_thread(
+                            convert_image_bytes_to_jpeg,
+                            resp.content[:IMAGE_READ_LIMIT],
+                        )
                         if converted is not None:
                             return converted
 
@@ -3076,7 +3084,7 @@ class ParserApp:
                     ) as resp:
                         if 200 <= resp.status < 300:
                             raw = await resp.content.read(IMAGE_READ_LIMIT)
-                            converted = convert_image_bytes_to_jpeg(raw)
+                            converted = await asyncio.to_thread(convert_image_bytes_to_jpeg, raw)
                             if converted is not None:
                                 return converted
 
@@ -3835,7 +3843,7 @@ class ParserApp:
                 self.album_tasks[group_id] = asyncio.create_task(self.flush_album(group_id, source_chat_id))
 
     async def flush_album(self, group_id: int, source_chat_id: int) -> None:
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(0.5)
         async with self.album_lock:
             messages = self.album_messages.pop(group_id, [])
             self.album_tasks.pop(group_id, None)
@@ -3883,43 +3891,55 @@ class ParserApp:
             )
             candidate_links = candidate_links[:self.settings.max_links_per_post]
 
-        results = await asyncio.gather(
-            *(self.resolve_url(url) for url in candidate_links),
-            return_exceptions=True,
-        )
-
         text_skus = extract_skus_from_text(source_text)
-        products: list[ProductInfo] = []
+        pre_resolved: dict[int, str] = {}
+        urls_to_resolve: list[tuple[int, str]] = []
 
-        for idx, (original_url, result) in enumerate(zip(candidate_links, results)):
-            resolved_url: str | None = None
-            if isinstance(result, Exception):
-                log(f"Ошибка раскрытия {original_url}: {result}", logging.WARNING)
-            else:
-                resolved_url = result
+        for idx, original_url in enumerate(candidate_links):
+            if has_product_sku(original_url):
+                pre_resolved[idx] = original_url
+                continue
 
-            if not resolved_url or not has_product_sku(resolved_url):
-                preview_url = match_message_preview_url(job.messages, original_url, len(candidate_links))
-                if preview_url:
-                    log(f"Используем URL из Telegram-превью для {original_url}: {preview_url}")
-                    resolved_url = preview_url
+            preview_url = match_message_preview_url(job.messages, original_url, len(candidate_links))
+            if preview_url and has_product_sku(preview_url):
+                log(f"Используем URL из Telegram-превью без сетевого запроса для {original_url}: {preview_url}")
+                pre_resolved[idx] = preview_url
+                continue
 
-            if (not resolved_url or not has_product_sku(resolved_url)) and text_skus:
-                matched_sku = None
+            matched_sku = None
+            if text_skus:
                 if len(candidate_links) == 1 and len(text_skus) == 1:
                     matched_sku = text_skus[0]
                 elif len(text_skus) == len(candidate_links):
                     matched_sku = text_skus[idx]
 
-                if matched_sku:
-                    host = normalize_host(urlparse(original_url).hostname)
-                    if is_ozon_host(host):
-                        canonical_host = resolve_ozon_canonical_host(host, self.settings.ozon_canonical_host)
-                        resolved_url = f"https://{canonical_host}/product/{matched_sku}/"
-                    else:
-                        resolved_url = f"https://www.wildberries.by/catalog/{matched_sku}/detail.aspx"
-                    log(f"Артикул {matched_sku} взят из текста поста для {original_url}")
+            if matched_sku:
+                host = normalize_host(urlparse(original_url).hostname)
+                if is_ozon_host(host):
+                    canonical_host = resolve_ozon_canonical_host(host, self.settings.ozon_canonical_host)
+                    pre_resolved[idx] = f"https://{canonical_host}/product/{matched_sku}/"
+                else:
+                    pre_resolved[idx] = f"https://www.wildberries.by/catalog/{matched_sku}/detail.aspx"
+                log(f"Артикул {matched_sku} взят из текста поста без сетевого запроса для {original_url}")
+                continue
 
+            urls_to_resolve.append((idx, original_url))
+
+        if urls_to_resolve:
+            net_results = await asyncio.gather(
+                *(self.resolve_url(url) for _, url in urls_to_resolve),
+                return_exceptions=True,
+            )
+            for (idx, original_url), result in zip(urls_to_resolve, net_results):
+                if isinstance(result, Exception):
+                    log(f"Ошибка раскрытия {original_url}: {result}", logging.WARNING)
+                elif result:
+                    pre_resolved[idx] = result
+
+        products: list[ProductInfo] = []
+
+        for idx, original_url in enumerate(candidate_links):
+            resolved_url = pre_resolved.get(idx)
             if resolved_url is None:
                 continue
 
@@ -3948,24 +3968,40 @@ class ParserApp:
             unique_products.setdefault(product.sku_key, product)
         products = list(unique_products.values())
 
-        # Парсим карточки товаров (название, актуальная цена в BYN, средняя цена за месяц, фото, наличие)
+        # Ранняя дедупликация ДО парсинга карточек товаров
+        source_message_id = min(message.id for message in job.messages)
+        fresh_keys = self.db.reserve_fresh(products, job.source_chat_id, source_message_id)
+        if not fresh_keys:
+            self.state.duplicates += 1
+            log(f"Все товары из сообщения {job.source_chat_id}/{source_message_id} уже обработаны")
+            return
+
+        fresh_candidates = [product for product in products if product.sku_key in fresh_keys]
+
+        # Парсим карточки только для новых (не публиковавшихся ранее) товаров
         enriched_results = await asyncio.gather(
-            *(self.enrich_product_with_card(product, messages=job.messages) for product in products),
+            *(self.enrich_product_with_card(product, messages=job.messages) for product in fresh_candidates),
             return_exceptions=True,
         )
 
         available_products: list[ProductInfo] = []
-        for orig_prod, enriched in zip(products, enriched_results):
+        failed_keys: list[str] = []
+        for orig_prod, enriched in zip(fresh_candidates, enriched_results):
             if isinstance(enriched, Exception):
                 log(
                     f"Ошибка парсинга карточки {orig_prod.platform} ({orig_prod.sku}): {enriched}",
                     logging.WARNING,
                 )
+                failed_keys.append(orig_prod.sku_key)
                 continue
             if enriched is None:
                 self.state.out_of_stock += 1
+                failed_keys.append(orig_prod.sku_key)
                 continue
             available_products.append(enriched)
+
+        if failed_keys:
+            self.db.release_reservations(failed_keys)
 
         if not available_products:
             log(
@@ -3973,14 +4009,8 @@ class ParserApp:
             )
             return
 
-        source_message_id = min(message.id for message in job.messages)
-        fresh_keys = self.db.reserve_fresh(available_products, job.source_chat_id, source_message_id)
-        if not fresh_keys:
-            self.state.duplicates += 1
-            log(f"Все товары из сообщения {job.source_chat_id}/{source_message_id} уже обработаны")
-            return
-
-        fresh_products = [product for product in available_products if product.sku_key in fresh_keys]
+        fresh_products = available_products
+        fresh_keys = {product.sku_key for product in fresh_products}
         text = build_publication_text(
             source_text,
             fresh_products,
@@ -4276,6 +4306,7 @@ class ParserApp:
                     await self.curl_session.close()
             if self.http_session:
                 await self.http_session.close()
+            self.db.close()
             await self.user_client.disconnect()
             await self.bot_client.disconnect()
 
