@@ -1,7 +1,7 @@
 services:
-  tg_deals_parser_v2:
+  tg_deals_parser_v3:
     build: .
-    container_name: tg_deals_parser_v2
+    container_name: tg_deals_parser_v3
     restart: unless-stopped
     init: true
     shm_size: "1gb"
