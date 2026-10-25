@@ -12,8 +12,8 @@ services:
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
 
-    command: ["python", "-u", "/app/parser.py"]
+    command: ["python", "-u", "/app/parser.before_fix.py"]
 
     volumes:
       - ./data:/app/data
-      - ./parser.py:/app/parser.py:ro
+      - ./parser.before_fix.py:/app/parser.before_fix.py:ro

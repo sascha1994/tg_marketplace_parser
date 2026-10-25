@@ -5,9 +5,8 @@ import os
 import re
 import sqlite3
 import time
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Iterable
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -19,18 +18,68 @@ from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.tl.types import MessageMediaWebPage
 from telethon.utils import get_peer_id
 
-
 load_dotenv()
 
 ALLOWED_DOMAINS = frozenset({"wildberries.ru", "wb.ru", "ozon.ru", "ozon.by", "ozon.kz"})
-USER_AGENT = "TGDealsParser/2.0 (+https://t.me/)"
-URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+OZON_DOMAINS = ("ozon.ru", "ozon.by", "ozon.kz")
+USER_AGENT = "TGDealsParser/2.2 (+https://t.me/)"
+MAX_FLOOD_RETRIES = 3
+HEAD_READ_LIMIT = 150_000
+
+URL_RE = re.compile(r"https?://[^\s<>\[\]\(\)\"']+", re.IGNORECASE)
 WB_SKU_RE = re.compile(r"(?:www\.)?wildberries\.ru/catalog/(\d+)", re.IGNORECASE)
 OZON_SKU_RE = re.compile(
     r"(?:www\.)?ozon\.(?:ru|by|kz)/product/(?:[^/?#]*-)?(\d+)(?:[/?#]|$)",
     re.IGNORECASE,
 )
-PROMO_RE = re.compile(r"(мы в тг|мы в вк|подпишись|наш канал|источник:|t\.me/|vk\.com/)", re.IGNORECASE)
+# Артикул из <head> страницы (canonical / og:url), если в самом URL его нет,
+# например у реферальных ссылок вида ozon.ru/p/oXXXXXXX.
+HEAD_PRODUCT_RE = re.compile(
+    r"ozon\.(?:ru|by|kz)/product/(?:[^/\"'?#\s<>]*-)?(\d+)",
+    re.IGNORECASE,
+)
+PROMO_RE = re.compile(
+    r"(мы в тг|мы в telegram|мы в вк|подпишись|наш канал|источник:|t\.me/|vk\.com/)",
+    re.IGNORECASE,
+)
+
+# Слово «источник» намеренно не включено: оно встречается в описаниях товаров.
+# Рекламные строки «Источник:» отсекаются через PROMO_RE.
+NOISE_PHRASES = (
+    "мы в тг",
+    "мы в telegram",
+    "мы в вк",
+    "мы во вконтакте",
+    "подпишись",
+    "подписаться",
+    "подписка на канал",
+    "наш канал",
+    "наш телеграм",
+    "телеграм канал",
+    "telegram канал",
+    "ссылка = клик",
+    "ссылка клик",
+    "клик по артикулу",
+    "кликни по артикулу",
+    "жми по артикулу",
+    "жми на артикул",
+    "ссылка выше",
+    "жми сюда",
+    "нажми сюда",
+    "ставь реакцию",
+    "поставь реакцию",
+    "ставь лайк",
+    "поставь лайк",
+    "хочу больше подобного",
+    "обе карточки",
+    "дешевле нет",
+    "скидки каждый день",
+    "акции каждый день",
+)
+
+# Короткие реакции ищем только в начале строки и по границе слова,
+# чтобы не удалять «Женский топ», «Стоп-сигнал» и подобные названия.
+REACTION_RE = re.compile(r"^(круто|хочу больше|хочу ещё|хочу еще|лайк|огонь)\b")
 
 
 class ConfigError(RuntimeError):
@@ -164,7 +213,7 @@ class DuplicateDB:
         return conn
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS seen_items (
@@ -185,7 +234,12 @@ class DuplicateDB:
                 "ON seen_items(status, published_at, created_at)"
             )
 
-    def reserve_fresh(self, products: Iterable[ProductInfo], source_chat_id: int, source_message_id: int) -> set[str]:
+    def reserve_fresh(
+        self,
+        products: Iterable[ProductInfo],
+        source_chat_id: int,
+        source_message_id: int,
+    ) -> set[str]:
         products_by_key = {product.sku_key: product for product in products}
         if not products_by_key:
             return set()
@@ -194,7 +248,7 @@ class DuplicateDB:
         published_cutoff = now - self.cooldown_seconds
         pending_cutoff = now - self.pending_ttl_seconds
 
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(
@@ -245,7 +299,7 @@ class DuplicateDB:
             return
         now = int(time.time())
         placeholders = ",".join("?" for _ in keys)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 f"UPDATE seen_items SET status = 'published', published_at = ? "
                 f"WHERE status = 'pending' AND sku_key IN ({placeholders})",
@@ -257,18 +311,18 @@ class DuplicateDB:
         if not keys:
             return
         placeholders = ",".join("?" for _ in keys)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 f"DELETE FROM seen_items WHERE status = 'pending' AND sku_key IN ({placeholders})",
                 keys,
             )
 
     def clear_published(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("DELETE FROM seen_items")
 
     def count_by_status(self) -> tuple[int, int]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) FROM seen_items GROUP BY status"
             ).fetchall()
@@ -289,6 +343,11 @@ def is_allowed_host(hostname: str | None) -> bool:
     return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_DOMAINS)
 
 
+def is_ozon_host(hostname: str | None) -> bool:
+    host = normalize_host(hostname)
+    return any(host == domain or host.endswith("." + domain) for domain in OZON_DOMAINS)
+
+
 def validate_marketplace_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -302,56 +361,19 @@ def validate_marketplace_url(url: str) -> bool:
         return False
 
 
-def extract_links(message) -> set[str]:
-    raw_urls = set(URL_RE.findall(message.raw_text or ""))
+def extract_links(message) -> list[str]:
+    """Возвращает ссылки в порядке появления без дублей."""
+    urls = list(URL_RE.findall(message.raw_text or ""))
     for entity in message.entities or []:
         url = getattr(entity, "url", None)
         if url:
-            raw_urls.add(url)
-    return {url.rstrip(".,;:!?)>\"'") for url in raw_urls}
-
-
-NOISE_PHRASES = (
-    "мы в тг",
-    "мы в telegram",
-    "мы в вк",
-    "мы во вконтакте",
-    "подпишись",
-    "подписаться",
-    "подписка на канал",
-    "подписаться на канал",
-    "наш канал",
-    "наш телеграм",
-    "телеграм канал",
-    "telegram канал",
-    "источник",
-    "ссылка = клик",
-    "ссылка клик",
-    "клик по артикулу",
-    "кликни по артикулу",
-    "жми по артикулу",
-    "жми на артикул",
-    "ссылка выше",
-    "жми сюда",
-    "нажми сюда",
-    "ставь реакцию",
-    "поставь реакцию",
-    "ставь лайк",
-    "поставь лайк",
-    "хочу больше подобного",
-    "обе карточки",
-    "дешевле нет",
-    "скидки каждый день",
-    "акции каждый день",
-)
+            urls.append(url)
+    cleaned = (url.rstrip(".,;:!?)>\"'") for url in urls)
+    return list(dict.fromkeys(cleaned))
 
 
 def normalize_filter_text(text: str) -> str:
-    """
-    Нормализует строку для сравнения:
-    убирает emoji/знаки препинания, приводит к нижнему регистру
-    и схлопывает несколько пробелов.
-    """
+    """Убирает emoji и знаки препинания, приводит к нижнему регистру."""
     text = text.casefold()
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip()
@@ -362,30 +384,23 @@ def clean_external_promo(text: str) -> str:
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
-
         if not line:
             continue
 
         normalized = normalize_filter_text(line)
 
-        # Ссылки на внешний Telegram/VK и прямые рекламные строки.
         if PROMO_RE.search(line):
             continue
 
-        # Явные фразы-призывы и служебный текст скидочных каналов.
         if any(phrase in normalized for phrase in NOISE_PHRASES):
             continue
 
-        # Строки только из emoji, символов или декоративных разделителей.
+        # Строки только из emoji, символов или разделителей.
         if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", line):
             continue
 
-        # Короткие строки-реакции наподобие:
-        # "🔥 - круто", "❤️ хочу ещё", "👍 +"
-        if len(normalized) <= 35 and re.search(
-            r"(круто|хочу|еще|ещё|лайк|реакц|огонь|топ)",
-            normalized,
-        ):
+        # Короткие строки-реакции: «🔥 - круто», «❤️ хочу ещё».
+        if len(normalized) <= 35 and REACTION_RE.match(normalized):
             continue
 
         cleaned_lines.append(line)
@@ -409,9 +424,9 @@ def parse_product_info(original_url: str, resolved_url: str) -> ProductInfo:
     ozon_match = OZON_SKU_RE.search(resolved_url)
     if ozon_match:
         sku = ozon_match.group(1)
-        parsed = urlparse(resolved_url)
-        host = normalize_host(parsed.hostname)
-        canonical_host = host if host in {"ozon.ru", "ozon.by", "ozon.kz"} else "ozon.ru"
+        host = normalize_host(urlparse(resolved_url).hostname)
+        host = host[4:] if host.startswith("www.") else host
+        canonical_host = host if host in OZON_DOMAINS else "ozon.ru"
         return ProductInfo(
             original_url=original_url,
             resolved_url=resolved_url,
@@ -441,18 +456,12 @@ def build_publication_text(source_text: str, products: list[ProductInfo]) -> str
     def remove_marketplace_url(match: re.Match) -> str:
         raw_url = match.group(0)
         clean_url = raw_url.rstrip(".,;:!?)>\"'")
-
         if validate_marketplace_url(clean_url):
-            # Сохраняем завершающий знак препинания, если он был.
-            suffix = raw_url[len(clean_url):]
-            return suffix
-
+            return raw_url[len(clean_url):]
         return raw_url
 
-    # Убираем исходные URL WB/Ozon: ниже будет добавлена canonical-ссылка.
+    # Исходные WB/Ozon-ссылки убираем: ниже добавляется canonical-ссылка.
     source_text = URL_RE.sub(remove_marketplace_url, source_text)
-
-    # Убираем лишние пробелы и пустые строки, оставшиеся после удаления URL.
     source_text = re.sub(r"[ \t]+\n", "\n", source_text)
     source_text = re.sub(r"\n{3,}", "\n\n", source_text).strip()
 
@@ -460,38 +469,19 @@ def build_publication_text(source_text: str, products: list[ProductInfo]) -> str
 
     if source_text:
         lines.append(source_text)
-
     elif len(products) == 1:
-        product = products[0]
-
-        if product.sku:
-            lines.append(
-                f"🔥 Новая находка на {product.platform}\n"
-                f"Артикул: {product.sku}"
-            )
-        else:
-            lines.append(
-                f"🔥 Новая находка на {product.platform}"
-            )
-
+        lines.append(f"🔥 Новая находка на {products[0].platform}")
     elif len(products) > 1:
-        lines.append(
-            f"🔥 Подборка товаров: {len(products)} шт."
-        )
+        lines.append(f"🔥 Подборка товаров: {len(products)} шт.")
 
     if products:
         product_lines = ["🛍 Товары"]
-
         for product in products:
             icon = "🟣" if product.platform == "Wildberries" else "🔵"
-
             product_lines.append(f"{icon} {product.platform}")
-
             if product.sku:
                 product_lines.append(f"Артикул: {product.sku}")
-
             product_lines.append(product.canonical_url)
-
         lines.append("\n".join(product_lines))
 
     return "\n\n".join(lines).strip()
@@ -533,6 +523,7 @@ class ParserApp:
         self.current_sources: set[int] = set()
         self.queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=500)
         self.workers: list[asyncio.Task] = []
+        self.retry_tasks: set[asyncio.Task] = set()
         self.resolve_semaphore = asyncio.Semaphore(8)
         self.publish_lock = asyncio.Lock()
         self.album_messages: dict[int, list] = {}
@@ -543,8 +534,7 @@ class ParserApp:
     async def host_has_only_public_ips(self, hostname: str) -> bool:
         """Дополнительная защита от SSRF; allowlist доменов проверяется отдельно."""
         try:
-            ip = ipaddress.ip_address(hostname)
-            return ip.is_global
+            return ipaddress.ip_address(hostname).is_global
         except ValueError:
             pass
         try:
@@ -555,27 +545,58 @@ class ParserApp:
         except (OSError, ValueError):
             return False
 
+    async def upgrade_to_product_url(self, url: str, status: int) -> str:
+        """Если в URL нет артикула (например, ozon.ru/p/oXXXX), ищем его в <head> страницы."""
+        if WB_SKU_RE.search(url) or OZON_SKU_RE.search(url):
+            return url
+
+        host = normalize_host(urlparse(url).hostname)
+        if not is_ozon_host(host) or status != 200:
+            return url
+
+        assert self.http_session is not None
+        try:
+            async with self.resolve_semaphore:
+                async with self.http_session.get(url, allow_redirects=False) as response:
+                    if response.status != 200:
+                        return url
+                    raw = await response.content.read(HEAD_READ_LIMIT)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log(f"Не удалось прочитать страницу {url}: {type(exc).__name__}: {exc}", logging.WARNING)
+            return url
+
+        head = raw.decode("utf-8", errors="ignore").split("</head>", 1)[0]
+        match = HEAD_PRODUCT_RE.search(head)
+        if not match:
+            log(f"Артикул в <head> не найден: {url}", logging.WARNING)
+            return url
+
+        sku = match.group(1)
+        log(f"Артикул {sku} получен из <head> страницы {url}")
+        return f"https://{host}/product/{sku}/"
+
     async def resolve_url(self, url: str) -> str | None:
         if not validate_marketplace_url(url):
             return None
         assert self.http_session is not None
         current_url = url
+        max_redirects = self.settings.max_redirects
 
-        for step in range(1, self.settings.max_redirects + 1):
-            parsed = urlparse(current_url)
-            host = normalize_host(parsed.hostname)
+        # +1 итерация нужна, чтобы запросить итоговую страницу
+        # после последнего разрешённого редиректа.
+        for step in range(1, max_redirects + 2):
+            host = normalize_host(urlparse(current_url).hostname)
             if not validate_marketplace_url(current_url) or not await self.host_has_only_public_ips(host):
                 log(f"Отклонён небезопасный URL/редирект: {current_url}", logging.WARNING)
                 return None
 
+            antibot = None
             try:
                 async with self.resolve_semaphore:
-                    async with self.http_session.head(
-                        current_url,
-                        allow_redirects=False,
-                    ) as response:
+                    async with self.http_session.head(current_url, allow_redirects=False) as response:
                         status = response.status
                         location = response.headers.get("Location")
+                        antibot = response.headers.get("ozon-antibot")
                         response.release()
 
                     if status in {403, 405, 501}:
@@ -586,18 +607,22 @@ class ParserApp:
                         ) as response:
                             status = response.status
                             location = response.headers.get("Location")
+                            antibot = response.headers.get("ozon-antibot")
                             response.release()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log(f"Не удалось раскрыть URL {url}: {type(exc).__name__}: {exc}", logging.WARNING)
                 return None
 
             if location and 300 <= status < 400:
+                if step > max_redirects:
+                    break
                 next_url = urljoin(current_url, location)
-                log(f"Редирект {step}/{self.settings.max_redirects}: {status} {current_url} -> {next_url}")
+                log(f"Редирект {step}/{max_redirects}: {status} {current_url} -> {next_url}")
                 current_url = next_url
                 continue
 
-            return current_url
+            log(f"Конец цепочки: HTTP {status}, ozon-antibot={antibot}, {current_url}")
+            return await self.upgrade_to_product_url(current_url, status)
 
         log(f"Превышен лимит редиректов для {url}", logging.WARNING)
         return None
@@ -629,45 +654,34 @@ class ParserApp:
 
         include_peers = list(getattr(matched, "include_peers", []))
         pinned_peers = list(getattr(matched, "pinned_peers", []))
-
         log(
             f"Папка «{self.settings.folder_name}»: "
-            f"include_peers={len(include_peers)}, "
-            f"pinned_peers={len(pinned_peers)}"
+            f"include_peers={len(include_peers)}, pinned_peers={len(pinned_peers)}"
         )
 
         # Для парсинга используем только явно включённые источники.
-        peers = include_peers
         seen: set[int] = set()
         source_ids: list[int] = []
         channels: list[dict] = []
-        for peer in peers:
-            peer_id = get_peer_id(peer)
 
+        for peer in include_peers:
+            peer_id = get_peer_id(peer)
             if peer_id in seen:
                 continue
-
             seen.add(peer_id)
 
-            # Не слушаем собственный целевой канал.
             if peer_id == self.target_peer_id:
-                log(
-                    f"Целевой канал {peer_id} исключён из источников",
-                    logging.WARNING,
-                )
+                log(f"Целевой канал {peer_id} исключён из источников", logging.WARNING)
                 continue
 
             try:
                 entity = await self.user_client.get_entity(peer)
-
                 title = (
-                        getattr(entity, "title", None)
-                        or getattr(entity, "first_name", None)
-                        or f"Чат {peer_id}"
+                    getattr(entity, "title", None)
+                    or getattr(entity, "first_name", None)
+                    or f"Чат {peer_id}"
                 )
-
             except Exception as exc:
-                # ВАЖНО: не добавляем недоступный/удалённый канал в current_sources.
                 log(
                     f"Источник {peer_id} пропущен: нет доступа или канал удалён. "
                     f"{type(exc).__name__}: {exc}",
@@ -675,15 +689,9 @@ class ParserApp:
                 )
                 continue
 
-            # ID добавляется только после успешного получения сущности.
             source_ids.append(peer_id)
+            channels.append({"id": peer_id, "title": title})
 
-            channels.append(
-                {
-                    "id": peer_id,
-                    "title": title,
-                }
-            )
         return source_ids, channels
 
     async def update_sources(self) -> list[dict]:
@@ -697,6 +705,8 @@ class ParserApp:
                 events.NewMessage(chats=list(self.current_sources)),
             )
         log(f"Источники обновлены: {len(self.current_sources)}")
+        for channel in channels:
+            log(f"Источник: [{channel['id']}] {channel['title']}")
         if not self.current_sources:
             log("Нет доступных источников: проверьте папку и её явно добавленные чаты", logging.WARNING)
         return channels
@@ -735,16 +745,31 @@ class ParserApp:
             log(f"Очередь переполнена; сообщение из {job.source_chat_id} пропущено", logging.ERROR)
             await self.notify_admin("⚠️ Очередь парсера переполнена. Одно сообщение пропущено.")
 
-    async def process_job(self, job: Job) -> None:
-        source_text = "\n".join(filter(None, (message.raw_text or "" for message in job.messages)))
-        raw_links: set[str] = set()
-        for message in job.messages:
-            raw_links.update(extract_links(message))
+    async def requeue_later(self, job: Job, delay: int) -> None:
+        await asyncio.sleep(delay)
+        await self.enqueue(job)
 
-        candidate_links = [url for url in raw_links if validate_marketplace_url(url)]
+    def schedule_retry(self, job: Job, delay: int) -> None:
+        task = asyncio.create_task(self.requeue_later(job, delay))
+        self.retry_tasks.add(task)
+        task.add_done_callback(self.retry_tasks.discard)
+
+    async def process_job(self, job: Job) -> None:
+        # Для альбома берём первый непустой текст, а не склеиваем подписи всех фото.
+        source_text = next(
+            (message.raw_text for message in job.messages if message.raw_text),
+            "",
+        )
+
+        raw_links: list[str] = []
+        for message in job.messages:
+            raw_links.extend(extract_links(message))
+
+        candidate_links = list(dict.fromkeys(url for url in raw_links if validate_marketplace_url(url)))
         if not candidate_links:
             self.state.rejected += 1
             return
+
         if len(candidate_links) > self.settings.max_links_per_post:
             log(
                 f"В посте {job.source_chat_id} ссылок {len(candidate_links)}; "
@@ -753,7 +778,10 @@ class ParserApp:
             )
             candidate_links = candidate_links[:self.settings.max_links_per_post]
 
-        results = await asyncio.gather(*(self.resolve_url(url) for url in candidate_links), return_exceptions=True)
+        results = await asyncio.gather(
+            *(self.resolve_url(url) for url in candidate_links),
+            return_exceptions=True,
+        )
         products: list[ProductInfo] = []
         for original_url, result in zip(candidate_links, results):
             if isinstance(result, Exception):
@@ -769,13 +797,10 @@ class ParserApp:
             self.state.rejected += 1
             return
 
-        # Одна карточка товара может быть найдена дважды:
-        # например, в raw_text и в Telegram entity, либо через short + direct URL.
+        # Один товар мог прийти дважды (короткая + прямая ссылка).
         unique_products: dict[str, ProductInfo] = {}
-
         for product in products:
             unique_products.setdefault(product.sku_key, product)
-
         products = list(unique_products.values())
 
         source_message_id = min(message.id for message in job.messages)
@@ -787,16 +812,31 @@ class ParserApp:
 
         fresh_products = [product for product in products if product.sku_key in fresh_keys]
         text = build_publication_text(source_text, fresh_products)
+
+        # DRY_RUN: ничего не публикуем и не оставляем SKU в базе.
+        if self.settings.dry_run:
+            log(f"DRY_RUN — публикация НЕ выполнена {job.source_chat_id}/{source_message_id}:\n{text}")
+            self.db.release_reservations(fresh_keys)
+            return
+
         try:
-            if self.settings.dry_run:
-                log(f"DRY_RUN {job.source_chat_id}/{source_message_id}:\n{text}")
-            else:
-                await self.publish(text, job.messages)
+            await self.publish(text, job.messages)
         except FloodWaitError as exc:
             self.db.release_reservations(fresh_keys)
             self.state.errors += 1
-            log(f"FloodWait на {exc.seconds} сек. Товары освобождены для повторной обработки", logging.ERROR)
-            await self.notify_admin(f"⚠️ Telegram FloodWait: {exc.seconds} сек. Публикация не выполнена.")
+            log(f"FloodWait на {exc.seconds} сек. Товары освобождены", logging.ERROR)
+            if job.attempts < MAX_FLOOD_RETRIES:
+                job.attempts += 1
+                self.schedule_retry(job, exc.seconds + 1)
+                await self.notify_admin(
+                    f"⚠️ Telegram FloodWait: {exc.seconds} сек. "
+                    f"Повтор {job.attempts}/{MAX_FLOOD_RETRIES}."
+                )
+            else:
+                await self.notify_admin(
+                    f"⚠️ FloodWait: пост {job.source_chat_id}/{source_message_id} "
+                    f"пропущен после {MAX_FLOOD_RETRIES} попыток."
+                )
         except Exception as exc:
             self.db.release_reservations(fresh_keys)
             self.state.errors += 1
@@ -809,45 +849,35 @@ class ParserApp:
 
     async def publish(self, text: str, messages: list) -> None:
         if not text and not any(getattr(message, "media", None) for message in messages):
-            raise RuntimeError(
-                "Не сформирован текст и отсутствуют медиа для публикации"
-            )
+            raise RuntimeError("Не сформирован текст и отсутствуют медиа для публикации")
 
         async with self.publish_lock:
             media = [
                 message.media
                 for message in messages
-                if message.media
-                   and not isinstance(message.media, MessageMediaWebPage)
+                if message.media and not isinstance(message.media, MessageMediaWebPage)
             ]
 
-            # У caption у Telegram лимит 1024 символа.
-            # Остаток текста при необходимости отправится отдельными сообщениями.
-            text_parts = split_text(text, limit=1024)
-
-            if media:
-                caption = text_parts.pop(0) if text_parts else None
-
-                await self.user_client.send_file(
-                    self.target_entity,
-                    media if len(media) > 1 else media[0],
-                    caption=caption,
-                    parse_mode=None,
-                )
-
-            # Если пост без медиа — отправляем весь текст сообщениями до 4000 символов.
-            elif text:
+            if not media:
                 for text_part in split_text(text, limit=4000):
                     await self.user_client.send_message(
                         self.target_entity,
                         text_part,
                         link_preview=False,
                     )
-
                 return
 
-            # Если текст не поместился в подпись к медиа,
-            # отправляем оставшиеся части следом.
+            # Лимит подписи к медиа — 1024 символа, остаток уходит отдельно.
+            text_parts = split_text(text, limit=1024)
+            caption = text_parts.pop(0) if text_parts else None
+
+            await self.user_client.send_file(
+                self.target_entity,
+                media if len(media) > 1 else media[0],
+                caption=caption,
+                parse_mode=None,
+            )
+
             for text_part in text_parts:
                 await self.user_client.send_message(
                     self.target_entity,
@@ -949,7 +979,8 @@ class ParserApp:
                 await self.send_long_admin_message(self.format_channels_message(channels, "Источники"))
             elif data == b"clear_db_confirm":
                 await event.edit(
-                    "⚠️ Удалить всю историю дедупликации? После этого старые товары могут быть опубликованы повторно.",
+                    "⚠️ Удалить всю историю дедупликации? "
+                    "После этого старые товары могут быть опубликованы повторно.",
                     buttons=[
                         [Button.inline("✅ Да, удалить", b"clear_db_execute")],
                         [Button.inline("↩️ Отмена", b"refresh")],
@@ -978,8 +1009,13 @@ class ParserApp:
             await self.user_client.start()
             await self.bot_client.start(bot_token=self.settings.bot_token)
 
-            target_reference = self.settings.target_channel
+            me = await self.user_client.get_me()
+            log(
+                f"User-клиент авторизован как: {me.first_name or ''} {me.last_name or ''} "
+                f"(@{me.username or 'без_username'}, id={me.id})"
+            )
 
+            target_reference = self.settings.target_channel
             if target_reference.lstrip("-").isdigit():
                 target_reference = int(target_reference)
 
@@ -1002,12 +1038,10 @@ class ParserApp:
                 self.bot_client.run_until_disconnected(),
             )
         finally:
-            for task in self.workers:
+            pending = [*self.workers, *self.album_tasks.values(), *self.retry_tasks]
+            for task in pending:
                 task.cancel()
-            for task in self.album_tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.workers, return_exceptions=True)
-            await asyncio.gather(*self.album_tasks.values(), return_exceptions=True)
+            await asyncio.gather(*pending, return_exceptions=True)
             if self.http_session:
                 await self.http_session.close()
             await self.user_client.disconnect()
