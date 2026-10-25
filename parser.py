@@ -164,6 +164,22 @@ ALLOWED_DOMAINS = frozenset(
 OZON_DOMAINS = ("ozon.ru", "ozon.by", "ozon.kz")
 WB_DOMAINS = ("wildberries.ru", "wildberries.by", "wb.ru")
 
+WB_SEARCH_SHARDS = (
+    "common",
+    "preset",
+    "msk",
+    "blackhole",
+    "male",
+    "female",
+    "sport",
+    "beauty",
+    "electronic",
+    "household",
+)
+
+# Кэш найденных корзин Wildberries: vol -> хост (например "basket-28.wbbasket.ru")
+WB_BASKET_CACHE: dict[int, str] = {}
+
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -186,6 +202,25 @@ OZON_APP_HEADERS = {
     "Accept": "application/json; charset=utf-8",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
+
+OZON_WEB_HEADERS = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "x-o3-app-name": "dweb_client",
+    "x-o3-app-version": "release_2026",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Referer": "https://ozon.by/",
+}
+
+OZON_AUTH_COOKIE_NAMES = frozenset(
+    {
+        "__Secure-access-token",
+        "__Secure-refresh-token",
+        "__Secure-user-id",
+        "access_token",
+        "refresh_token",
+    }
+)
 
 DEFAULT_HEADERS = {
     "User-Agent": BROWSER_USER_AGENT,
@@ -344,6 +379,7 @@ OUT_OF_STOCK_MARKERS = (
     "нет в наличии",
     "товар закончился",
     "раскупили",
+    "продано",
     "нет в продаже",
     "недоступен для заказа",
     "товар недоступен",
@@ -357,6 +393,7 @@ NOT_FOUND_MARKERS = (
     "страница не найдена",
     "товар не найден",
     "такой страницы не существует",
+    "по вашему запросу ничего не найдено",
     "ошибка 404",
 )
 
@@ -414,7 +451,7 @@ TITLE_SEO_SUFFIX_PATTERNS = (
 
 PRICE_VALUE_RE = re.compile(
     r"(\d[\d\s\u00a0\u202f\u2009]*(?:[.,]\d{1,2})?)\s*"
-    r"(byn|бел\.?\s*руб\.?|бр|br|р\.|руб\.?|₽|rub|rur)?",
+    r"(byn|бел\.?\s*руб\.?|бр|br|б(?![а-яёa-z])|р\.|руб\.?|₽|rub|rur)?",
     re.IGNORECASE,
 )
 
@@ -663,6 +700,8 @@ class ProductInfo:
 
     @property
     def formatted_avg_month_price_byn(self) -> str | None:
+        if self.platform == "Wildberries":
+            return None
         if (
             self.avg_month_price_byn is not None
             and self.price_byn is not None
@@ -961,7 +1000,6 @@ def normalize_image_url(url: str | None) -> str:
         cleaned = "https:" + cleaned
     if not cleaned.startswith(("http://", "https://")):
         return ""
-    # Для CDN Ozon заменяем маленькие превью /wc200/, /wc500/ на /wc1000/
     if "ozone.ru/" in cleaned or "ozonusercontent.com/" in cleaned:
         cleaned = re.sub(r"/wc\d+/", "/wc1000/", cleaned)
     return cleaned
@@ -991,7 +1029,6 @@ def convert_image_bytes_to_jpeg(raw_bytes: bytes) -> io.BytesIO | None:
                 buf.name = "product.jpg"
                 return buf
 
-    # Если Pillow не установлен, проверяем, что это не WEBP (WEBP без конвертации Telegram считает стикером)
     if raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
         return None
 
@@ -1019,25 +1056,20 @@ def clean_product_title(raw_title: str | None, brand: str | None = "") -> str:
     if not title:
         return clean_brand
 
-    # Отрезаем префиксы вида «Купить ...»
     title = TITLE_SEO_PREFIX_RE.sub("", title).strip()
 
-    # Отрезаем суффиксы маркетплейсов («— купить в интернет-магазине OZON...», «/ Wildberries» и т.д.)
     for pattern in TITLE_SEO_SUFFIX_PATTERNS:
         title = pattern.sub("", title).strip()
 
-    # Убираем висящие разделители по краям
     title = title.strip(" /|-–—•,.;:")
     title = re.sub(r"\s+", " ", title).strip()
 
-    # Если весь заголовок кричащий КАПСОМ (более 12 букв и все в верхнем регистре), аккуратно нормализуем
     letters = [ch for ch in title if ch.isalpha()]
     if len(letters) > 12 and all(ch.isupper() for ch in letters):
         title = title.capitalize()
     elif title and title[0].islower():
         title = title[0].upper() + title[1:]
 
-    # Если указан бренд и его ещё нет в названии, аккуратно добавляем в начало
     if clean_brand:
         brand_lower = clean_brand.casefold()
         title_lower = title.casefold()
@@ -1083,7 +1115,10 @@ def parse_price_value_and_currency(
 
     text_lower = text.casefold()
     detected_currency = default_currency.upper()
-    if any(marker in text_lower for marker in ("byn", "бел", "бр", "br")):
+    if (
+        any(marker in text_lower for marker in ("byn", "бел", "бр", "br"))
+        or re.search(r"(?:^|[\s\u00a0\u202f\u2009\d])б(?![а-яёa-z])", text_lower)
+    ):
         detected_currency = "BYN"
     elif any(marker in text_lower for marker in ("₽", "rub", "rur", "рос")):
         detected_currency = "RUB"
@@ -1101,9 +1136,9 @@ def parse_price_value_and_currency(
     if val <= 0:
         return None, detected_currency
 
-    unit = (match.group(2) or "").casefold()
+    unit = (match.group(2) or "").casefold().strip()
     if unit:
-        if any(m in unit for m in ("byn", "бел", "бр", "br")):
+        if any(m in unit for m in ("byn", "бел", "бр", "br")) or unit == "б":
             detected_currency = "BYN"
         elif any(m in unit for m in ("₽", "rub", "rur")):
             detected_currency = "RUB"
@@ -1140,7 +1175,6 @@ def extract_avg_month_price_from_text(
 
     clean_text = clean_html_tags(text)
 
-    # 1. Вариант «13,22 BYN ... Средняя за сентябрь» (как в модальном окне Ozon «Стало дешевле»)
     m_before = AVG_PRICE_BEFORE_LABEL_RE.search(clean_text)
     if m_before:
         raw_p = f"{m_before.group(1)} {m_before.group(2)}"
@@ -1149,7 +1183,6 @@ def extract_avg_month_price_from_text(
         if byn_val is not None:
             return byn_val
 
-    # 2. Вариант «Средняя за сентябрь: 13,22 BYN»
     m_after = AVG_PRICE_AFTER_LABEL_RE.search(clean_text)
     if m_after:
         raw_p = f"{m_after.group(1)} {m_after.group(2) or default_currency}"
@@ -1158,7 +1191,6 @@ def extract_avg_month_price_from_text(
         if byn_val is not None:
             return byn_val
 
-    # 3. Если есть актуальная цена и зелёный бейдж снижения «↓ 4,83 BYN» рядом со «Стало дешевле»
     if actual_price_byn is not None and actual_price_byn > 0:
         m_drop = PRICE_DROP_BADGE_RE.search(clean_text)
         if m_drop:
@@ -1180,7 +1212,6 @@ def extract_ozon_avg_price_from_state(
 ) -> float | None:
     """Рекурсивно ищет среднюю цену за месяц в JSON-состоянии виджетов Ozon."""
     if isinstance(state, dict):
-        # Прямые ключи средней цены, если присутствуют
         for key in ("averagePrice", "avgPrice", "monthAvgPrice", "averageMonthPrice", "prevMonthAvgPrice"):
             if state.get(key):
                 val, curr = parse_price_value_and_currency(state[key], default_currency=default_currency)
@@ -1188,10 +1219,17 @@ def extract_ozon_avg_price_from_state(
                 if byn_val is not None:
                     return byn_val
 
-        # Если внутри словаря один из элементов содержит «Средняя за <месяц>», ищем цену в этом же словаре
         dict_strings = [str(v) for v in state.values() if isinstance(v, (str, int, float))]
         combined_dict_str = " | ".join(dict_strings)
         if AVG_MONTH_LABEL_RE.search(combined_dict_str):
+            inline_avg = extract_avg_month_price_from_text(
+                combined_dict_str,
+                actual_price_byn=actual_price_byn,
+                default_currency=default_currency,
+                rub_to_byn_rate=rub_to_byn_rate,
+            )
+            if inline_avg is not None:
+                return inline_avg
             for v in state.values():
                 if isinstance(v, str) and not AVG_MONTH_LABEL_RE.search(v):
                     val, curr = parse_price_value_and_currency(v, default_currency=default_currency)
@@ -1219,7 +1257,6 @@ def extract_ozon_avg_price_from_state(
             )
             if found is not None:
                 return found
-            # Если элемент списка содержит «Средняя за ...», проверяем соседние элементы списка
             if isinstance(item, (str, dict)) and AVG_MONTH_LABEL_RE.search(json.dumps(item, ensure_ascii=False)):
                 for neighbor_idx in (idx - 1, idx + 1):
                     if 0 <= neighbor_idx < len(state):
@@ -1232,51 +1269,69 @@ def extract_ozon_avg_price_from_state(
     return None
 
 
-def get_wb_basket_host(vol: int) -> str:
-    """Определяет номер корзины Wildberries (basket-01..basket-35.wbbasket.ru) по vol = sku // 100000."""
+def get_wb_basket_shard_number(vol: int) -> int:
+    """Определяет расчётный номер корзины Wildberries (1..45) по vol = sku // 100000."""
     ranges = (
-        (143, "01"),
-        (287, "02"),
-        (431, "03"),
-        (719, "04"),
-        (1007, "05"),
-        (1061, "06"),
-        (1115, "07"),
-        (1169, "08"),
-        (1313, "09"),
-        (1601, "10"),
-        (1655, "11"),
-        (1919, "12"),
-        (2045, "13"),
-        (2189, "14"),
-        (2405, "15"),
-        (2621, "16"),
-        (2837, "17"),
-        (3053, "18"),
-        (3269, "19"),
-        (3485, "20"),
-        (3701, "21"),
-        (3917, "22"),
-        (4133, "23"),
-        (4349, "24"),
-        (4565, "25"),
-        (4877, "26"),
-        (5189, "27"),
-        (5501, "28"),
-        (5813, "29"),
-        (6125, "30"),
-        (6437, "31"),
-        (6749, "32"),
-        (7061, "33"),
-        (7373, "34"),
+        (143, 1),
+        (287, 2),
+        (431, 3),
+        (719, 4),
+        (1007, 5),
+        (1061, 6),
+        (1115, 7),
+        (1169, 8),
+        (1313, 9),
+        (1601, 10),
+        (1655, 11),
+        (1919, 12),
+        (2045, 13),
+        (2189, 14),
+        (2405, 15),
+        (2621, 16),
+        (2837, 17),
+        (3053, 18),
+        (3269, 19),
+        (3485, 20),
+        (3701, 21),
+        (3917, 22),
+        (4133, 23),
+        (4349, 24),
+        (4565, 25),
+        (4877, 26),
+        (5189, 27),
+        (5501, 28),
+        (5813, 29),
+        (6125, 30),
+        (6437, 31),
+        (6749, 32),
+        (7061, 33),
+        (7373, 34),
+        (7685, 35),
+        (7997, 36),
+        (8309, 37),
+        (8621, 38),
+        (8933, 39),
+        (9245, 40),
+        (9557, 41),
+        (9869, 42),
+        (10181, 43),
+        (10493, 44),
     )
-    for max_vol, shard in ranges:
+    for max_vol, shard_num in ranges:
         if vol <= max_vol:
-            return f"basket-{shard}.wbbasket.ru"
-    return "basket-35.wbbasket.ru"
+            return shard_num
+    return 45
 
 
-def get_wb_card_image_url(sku: str | int) -> str:
+def get_wb_basket_host(vol: int) -> str:
+    """Возвращает хост корзины Wildberries (с учётом кэша динамического обнаружения)."""
+    if vol in WB_BASKET_CACHE:
+        return WB_BASKET_CACHE[vol]
+    shard_num = get_wb_basket_shard_number(vol)
+    return f"basket-{shard_num:02d}.wbbasket.ru"
+
+
+def get_wb_card_image_url(sku: str | int, basket_host: str | None = None) -> str:
     """Формирует прямую ссылку на главное фото карточки товара Wildberries на сервере корзины."""
     try:
         sku_int = int(sku)
@@ -1284,18 +1339,18 @@ def get_wb_card_image_url(sku: str | int) -> str:
         return ""
     vol = sku_int // 100_000
     part = sku_int // 1_000
-    basket_host = get_wb_basket_host(vol)
-    return f"https://{basket_host}/vol{vol}/part{part}/{sku_int}/images/big/1.webp"
+    host = basket_host or get_wb_basket_host(vol)
+    return f"https://{host}/vol{vol}/part{part}/{sku_int}/images/big/1.webp"
 
 
-def parse_wb_price_history_avg(
+def parse_wb_price_history_stats(
     history_list: Any,
     *,
     rub_to_byn_rate: float = 0.0345,
-) -> float | None:
-    """Вычисляет среднюю цену за последний месяц по истории цен Wildberries (price-history.json)."""
+) -> tuple[float | None, float | None]:
+    """Возвращает (avg_month_price_byn, latest_price_byn) по истории цен Wildberries (price-history.json)."""
     if not isinstance(history_list, list) or not history_list:
-        return None
+        return None, None
 
     now = int(time.time())
     month_cutoff = now - 35 * 86400
@@ -1323,49 +1378,72 @@ def parse_wb_price_history_avg(
             if dt >= month_cutoff:
                 recent_byn_prices.append(byn_val)
 
-    target_slice = recent_byn_prices if recent_byn_prices else all_byn_prices[-4:]
-    if not target_slice:
-        return None
+    if not all_byn_prices:
+        return None, None
 
-    return round(sum(target_slice) / len(target_slice), 2)
+    latest_price_byn = all_byn_prices[-1]
+    target_slice = recent_byn_prices if recent_byn_prices else all_byn_prices[-4:]
+    avg_month_price_byn = round(sum(target_slice) / len(target_slice), 2) if target_slice else None
+
+    return avg_month_price_byn, latest_price_byn
+
+
+def parse_wb_price_history_avg(
+    history_list: Any,
+    *,
+    rub_to_byn_rate: float = 0.0345,
+) -> float | None:
+    avg_price, _ = parse_wb_price_history_stats(history_list, rub_to_byn_rate=rub_to_byn_rate)
+    return avg_price
 
 
 def parse_wb_detail_payload(
     payload: dict[str, Any],
     *,
+    target_sku: str | int | None = None,
     currency: str = "BYN",
     rub_to_byn_rate: float = 0.0345,
 ) -> ProductCardData | None:
-    """Извлекает название, цену в BYN, ссылку на фото и наличие из ответа card.wb.ru/cards/v2(v4)/detail."""
+    """Извлекает название, цену в BYN, ссылку на фото и наличие из ответа Wildberries (card.wb.ru или u-search.wb.ru)."""
     if not isinstance(payload, dict):
         return None
 
     data_block = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     products = data_block.get("products")
-    if not isinstance(products, list):
+    if not isinstance(products, list) or not products:
+        # Если в данном ответе список products пуст (например, для конкретного региона dest или устаревшей версии API),
+        # возвращаем None, чтобы парсер проверил следующий dest / эндпоинт, а не браковал товар раньше времени.
         return None
 
-    if not products:
-        return ProductCardData(in_stock=False)
+    item = None
+    if target_sku is not None:
+        target_str = str(target_sku).strip()
+        for candidate in products:
+            if isinstance(candidate, dict) and str(candidate.get("id")) == target_str:
+                item = candidate
+                break
+        if item is None and len(products) == 1 and isinstance(products[0], dict):
+            item = products[0]
+    else:
+        item = products[0] if isinstance(products[0], dict) else None
 
-    item = products[0]
     if not isinstance(item, dict):
         return None
 
-    sku_id = item.get("id")
+    sku_id = item.get("id") or target_sku
     image_url = get_wb_card_image_url(sku_id) if sku_id else ""
 
     raw_name = str(item.get("name") or "").strip()
     raw_brand = str(item.get("brand") or "").strip()
     rating = None
     with suppress(TypeError, ValueError):
-        rating_val = item.get("reviewRating") or item.get("rating")
+        rating_val = item.get("reviewRating") or item.get("nmReviewRating") or item.get("rating")
         if rating_val is not None:
             rating = float(rating_val)
 
     reviews_count = None
     with suppress(TypeError, ValueError):
-        fb_val = item.get("feedbacks")
+        fb_val = item.get("feedbacks") or item.get("nmFeedbacks")
         if fb_val is not None:
             reviews_count = int(fb_val)
 
@@ -1373,7 +1451,6 @@ def parse_wb_detail_payload(
     sizes = item.get("sizes") if isinstance(item.get("sizes"), list) else []
 
     total_stocks_qty = 0
-    has_explicit_stocks_list = False
     candidate_product_prices: list[float] = []
     candidate_basic_prices: list[float] = []
     fallback_product_prices: list[float] = []
@@ -1385,7 +1462,6 @@ def parse_wb_detail_payload(
         stocks = size.get("stocks")
         size_qty = 0
         if isinstance(stocks, list):
-            has_explicit_stocks_list = True
             for st in stocks:
                 if isinstance(st, dict):
                     with suppress(TypeError, ValueError):
@@ -1394,38 +1470,57 @@ def parse_wb_detail_payload(
 
         price_obj = size.get("price")
         if isinstance(price_obj, dict):
-            prod_kop = price_obj.get("product") or price_obj.get("total")
-            basic_kop = price_obj.get("basic")
-            if prod_kop and int(prod_kop) > 0:
-                val = int(prod_kop) / 100.0
+            # В современном API Wildberries (v4/detail, v18/search) итоговая цена покупателя на карточке
+            # складывается из поля "product" + "logistics" (либо передаётся в "total").
+            # Использование только "product" без "logistics" занижает цену относительно витрины РБ.
+            tot_kop = int(price_obj.get("total") or 0)
+            prod_kop = int(price_obj.get("product") or 0)
+            log_kop = int(price_obj.get("logistics") or 0)
+            basic_kop = int(price_obj.get("basic") or 0)
+
+            if tot_kop > 0 or prod_kop > 0:
+                final_kop = max(tot_kop, prod_kop + max(0, log_kop))
+            else:
+                final_kop = basic_kop
+
+            if final_kop > 0:
+                val = final_kop / 100.0
                 fallback_product_prices.append(val)
                 if size_qty > 0 or not isinstance(stocks, list):
                     candidate_product_prices.append(val)
-            if basic_kop and int(basic_kop) > 0:
-                b_val = int(basic_kop) / 100.0
+            if basic_kop > 0:
+                b_val = basic_kop / 100.0
                 fallback_basic_prices.append(b_val)
                 if size_qty > 0 or not isinstance(stocks, list):
                     candidate_basic_prices.append(b_val)
 
-    if not candidate_product_prices and not fallback_product_prices:
-        sale_u = item.get("salePriceU") or item.get("extended", {}).get("clientPriceU") or item.get("priceU")
-        basic_u = item.get("priceU")
-        if sale_u and int(sale_u) > 0:
-            fallback_product_prices.append(int(sale_u) / 100.0)
-        if basic_u and int(basic_u) > 0:
-            fallback_basic_prices.append(int(basic_u) / 100.0)
-
-    if isinstance(total_quantity, int) and total_quantity <= 0:
-        in_stock = False
-    elif has_explicit_stocks_list and total_stocks_qty <= 0:
-        in_stock = False
-    elif not candidate_product_prices and not fallback_product_prices:
-        in_stock = False
-    else:
-        in_stock = True
+    # Фолбэк на поля верхнего уровня salePriceU / priceU / clientPriceU (в копейках)
+    for top_key in ("salePriceU", "priceU"):
+        top_val = item.get(top_key)
+        if top_val and int(top_val) > 0:
+            fallback_product_prices.append(int(top_val) / 100.0)
+    ext = item.get("extended")
+    if isinstance(ext, dict):
+        for ext_key in ("clientPriceU", "basicPriceU"):
+            ext_val = ext.get(ext_key)
+            if ext_val and int(ext_val) > 0:
+                fallback_product_prices.append(int(ext_val) / 100.0)
+    if item.get("priceU") and int(item["priceU"]) > 0:
+        fallback_basic_prices.append(int(item["priceU"]) / 100.0)
 
     active_prices = candidate_product_prices or fallback_product_prices
     active_basic = candidate_basic_prices or fallback_basic_prices
+
+    # Логика определения наличия на Wildberries:
+    # В современных эндпоинтах WB (v4/detail, v2/detail, v18/search) массив stocks может быть пустым ([]),
+    # но если товар есть в продаже, у него присутствует объект price (active_prices не пуст) и totalQuantity != 0.
+    # Если же товар реально раскуплен, то totalQuantity == 0 либо ни у одного размера нет объекта price.
+    if isinstance(total_quantity, int) and total_quantity <= 0 and total_stocks_qty <= 0:
+        in_stock = False
+    elif active_prices or total_stocks_qty > 0 or (isinstance(total_quantity, int) and total_quantity > 0):
+        in_stock = True
+    else:
+        in_stock = False
 
     raw_price = min(active_prices) if active_prices else None
     raw_old_price = max(active_basic) if active_basic else None
@@ -1487,7 +1582,6 @@ def parse_json_ld_product(
         else:
             brand = ""
 
-        # Извлекаем главное фото из поля image
         image_url = ""
         img_field = obj.get("image")
         if isinstance(img_field, str):
@@ -1576,7 +1670,6 @@ def parse_ozon_composer_payload(
     rating: float | None = None
     reviews_count: int | None = None
 
-    # 1. Проверяем встроенный JSON-LD внутри seo.script
     seo = payload.get("seo")
     if isinstance(seo, dict):
         seo_title = str(seo.get("title") or "").strip()
@@ -1600,7 +1693,6 @@ def parse_ozon_composer_payload(
         if not title and seo_title:
             title = clean_product_title(seo_title)
 
-    # 2. Анализируем widgetStates
     widget_states = payload.get("widgetStates")
     parsed_states: list[tuple[str, dict[str, Any], str]] = []
     if isinstance(widget_states, dict):
@@ -1615,13 +1707,11 @@ def parse_ozon_composer_payload(
                 parsed_states.append((widget_key.lower(), state, raw_state))
 
     for key_lower, state, _raw_state in parsed_states:
-        # Заголовок товара
         if "webproductheading" in key_lower:
             heading_title = str(state.get("title") or "").strip()
             if heading_title:
                 title = clean_product_title(heading_title, brand)
 
-        # Бренд товара
         elif "webbrand" in key_lower:
             b_name = str(state.get("name") or state.get("title") or "").strip()
             if b_name and b_name.casefold() not in GENERIC_BRAND_NAMES:
@@ -1629,7 +1719,6 @@ def parse_ozon_composer_payload(
                 if title:
                     title = clean_product_title(title, brand)
 
-        # Галерея фото товара (webGallery / webMobGallery)
         elif "webgallery" in key_lower or "gallery" in key_lower:
             cover = state.get("coverImage")
             if isinstance(cover, str) and cover:
@@ -1642,32 +1731,36 @@ def parse_ozon_composer_payload(
                 elif isinstance(first, str):
                     image_url = normalize_image_url(first)
 
-        # Виджет цены (webPrice)
         elif "webprice" in key_lower:
             if state.get("isAvailable") is False:
                 in_stock = False
             elif state.get("isAvailable") is True and in_stock is None:
                 in_stock = True
 
-            raw_actual = state.get("cardPrice") or state.get("price") or state.get("finalPrice")
-            raw_orig = state.get("originalPrice") or state.get("price")
-            if raw_actual:
-                val, curr = parse_price_value_and_currency(raw_actual, default_currency=default_currency)
-                converted = convert_to_byn(val, curr, rub_to_byn_rate)
-                if converted is not None:
-                    price_byn = converted
-            if raw_orig and raw_orig != raw_actual:
+            candidate_actual_byn: list[float] = []
+            for price_key in ("cardPrice", "ozonCardPrice", "accentPrice", "finalPrice", "price", " salePrice"):
+                raw_cand = state.get(price_key.strip())
+                if raw_cand:
+                    val, curr = parse_price_value_and_currency(raw_cand, default_currency=default_currency)
+                    converted = convert_to_byn(val, curr, rub_to_byn_rate)
+                    if converted is not None and converted > 0:
+                        candidate_actual_byn.append(converted)
+
+            if candidate_actual_byn:
+                best_actual = min(candidate_actual_byn)
+                price_byn = min(price_byn, best_actual) if price_byn is not None else best_actual
+
+            raw_orig = state.get("originalPrice") or state.get("basePrice") or state.get("price")
+            if raw_orig:
                 val_old, curr_old = parse_price_value_and_currency(raw_orig, default_currency=default_currency)
                 converted_old = convert_to_byn(val_old, curr_old, rub_to_byn_rate)
-                if converted_old is not None:
+                if converted_old is not None and (price_byn is None or converted_old > price_byn):
                     old_price_byn = converted_old
 
-        # Виджет отсутствия товара в наличии (webOutOfStock / webSoldOut)
         elif "outofstock" in key_lower or "soldout" in key_lower:
             if state:
                 in_stock = False
 
-        # Виджет кнопки покупки / корзины (webSale / webAddToCart)
         elif "websale" in key_lower or "addtocart" in key_lower:
             if state.get("isAvailable") is False or state.get("outOfStock") is True:
                 in_stock = False
@@ -1675,7 +1768,6 @@ def parse_ozon_composer_payload(
             if any(m in state_dump for m in OUT_OF_STOCK_MARKERS):
                 in_stock = False
 
-        # Виджет рейтинга и отзывов
         elif "reviewproductscore" in key_lower or "singleproductscore" in key_lower:
             with suppress(TypeError, ValueError):
                 if state.get("score") is not None:
@@ -1684,7 +1776,6 @@ def parse_ozon_composer_payload(
                 if state.get("count") is not None:
                     reviews_count = int(state["count"])
 
-    # Второй проход по widgetStates: ищем среднюю цену за месяц («Стало дешевле» / «Средняя за ...»)
     for key_lower, state, raw_state in parsed_states:
         if "webprice" in key_lower or "pricedecrease" in key_lower or "pricehistory" in key_lower or "средняя за" in raw_state.lower() or "стало дешевле" in raw_state.lower():
             found_avg = extract_ozon_avg_price_from_state(
@@ -1704,7 +1795,6 @@ def parse_ozon_composer_payload(
                 avg_month_price_byn = found_avg
                 break
 
-    # Проверяем общий текст ответа на среднюю цену за месяц, если в отдельных виджетах не нашли
     if avg_month_price_byn is None:
         full_dump = json.dumps(payload, ensure_ascii=False)
         avg_month_price_byn = extract_avg_month_price_from_text(
@@ -1767,7 +1857,6 @@ def parse_html_product_card(
 
     og_image = normalize_image_url(meta_map.get("og:image") or meta_map.get("twitter:image"))
 
-    # 1. Пробуем блоки JSON-LD (Schema.org Product)
     for match in JSON_LD_SCRIPT_RE.finditer(html_text):
         ld_card = parse_json_ld_product(
             match.group(1),
@@ -1791,7 +1880,6 @@ def parse_html_product_card(
                     return replace(ld_card, in_stock=False, price_byn=None, avg_month_price_byn=None)
             return ld_card
 
-    # 2. Извлекаем OpenGraph / meta-теги и <h1> / <title>
     raw_title = ""
     h1_match = H1_TAG_RE.search(html_text)
     if h1_match:
@@ -1935,16 +2023,25 @@ def parse_webpage_preview_card(
 
 
 def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData | None) -> ProductCardData | None:
-    """Объединяет данные карточки из двух источников, сохраняя наиболее полные поля."""
+    """Объединяет данные карточки из двух источников, сохраняя наиболее полные поля.
+
+    Если один из источников нашёл живую цену и наличие (in_stock=True, price_byn > 0),
+    он имеет приоритет над региональным ответом без наличия.
+    """
     if primary is None:
         return secondary
     if secondary is None:
         return primary
 
-    if primary.in_stock is False or secondary.in_stock is False:
-        in_stock = False
+    primary_has_price = primary.in_stock is True and primary.price_byn is not None and primary.price_byn > 0
+    secondary_has_price = secondary.in_stock is True and secondary.price_byn is not None and secondary.price_byn > 0
+
+    if primary_has_price or secondary_has_price:
+        in_stock: bool | None = True
     elif primary.in_stock is True or secondary.in_stock is True:
         in_stock = True
+    elif primary.in_stock is False or secondary.in_stock is False:
+        in_stock = False
     else:
         in_stock = None
 
@@ -1955,11 +2052,18 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
         title = primary.title or secondary.title
     title = clean_product_title(title, brand)
 
-    price_byn = (primary.price_byn if primary.price_byn is not None else secondary.price_byn) if in_stock is not False else None
+    if in_stock is False:
+        price_byn = None
+    elif primary.price_byn is not None and secondary.price_byn is not None:
+        price_byn = min(primary.price_byn, secondary.price_byn)
+    else:
+        price_byn = primary.price_byn if primary.price_byn is not None else secondary.price_byn
     avg_month_price_byn = (
         primary.avg_month_price_byn if primary.avg_month_price_byn is not None else secondary.avg_month_price_byn
     ) if in_stock is not False else None
-    old_price_byn = (primary.old_price_byn if primary.old_price_byn is not None else secondary.old_price_byn) if in_stock is not False else None
+    old_price_byn = (
+        primary.old_price_byn if primary.old_price_byn is not None else secondary.old_price_byn
+    ) if in_stock is not False else None
     image_url = primary.image_url or secondary.image_url
 
     return ProductCardData(
@@ -2207,13 +2311,10 @@ def _format_single_product_block(product: ProductInfo, index: int | None = None)
     ]
 
     price_str = product.formatted_price_byn
-    avg_month_str = product.formatted_avg_month_price_byn
-    old_price_str = product.formatted_old_price_byn
+    avg_month_str = product.formatted_avg_month_price_byn if product.platform != "Wildberries" else None
     if price_str:
         if avg_month_str:
             paragraphs.append(f"💰 Цена: {price_str} (средняя за месяц: {avg_month_str})")
-        elif old_price_str:
-            paragraphs.append(f"💰 Цена: {price_str} (было {old_price_str})")
         else:
             paragraphs.append(f"💰 Цена: {price_str}")
 
@@ -2299,8 +2400,124 @@ def build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def parse_ozon_cookies_input(raw_input: str) -> list[dict[str, Any]]:
+    """Универсальный парсер cookies Ozon из любого формата:
+    1) JSON-массив из расширений Cookie-Editor / EditThisCookie / Playwright ([{"name": ..., "value": ...}])
+    2) JSON-объект ({"cookies": [...]} или {"__Secure-access-token": "...", ...})
+    3) Формат Netscape cookies.txt (табличный с табуляцией)
+    4) Строка заголовка Cookie: key1=val1; key2=val2
+    Автоматически дублирует ключевые сессионные cookies на все домены Ozon (.ozon.by, .ozon.ru).
+    """
+    if not raw_input or not raw_input.strip():
+        return []
+
+    text = raw_input.strip()
+    if text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+
+    raw_items: list[dict[str, Any]] = []
+
+    if text.startswith(("[", "{")):
+        with suppress(Exception):
+            parsed_json = json.loads(text)
+            if isinstance(parsed_json, list):
+                for item in parsed_json:
+                    if isinstance(item, dict) and item.get("name") and item.get("value") is not None:
+                        raw_items.append(item)
+            elif isinstance(parsed_json, dict):
+                if isinstance(parsed_json.get("cookies"), list):
+                    for item in parsed_json["cookies"]:
+                        if isinstance(item, dict) and item.get("name") and item.get("value") is not None:
+                            raw_items.append(item)
+                else:
+                    for k, v in parsed_json.items():
+                        if isinstance(v, (str, int, float)):
+                            raw_items.append({"name": str(k).strip(), "value": str(v).strip(), "domain": ".ozon.by"})
+
+    if not raw_items:
+        # Проверяем Netscape-формат (7 колонок через табуляцию) или обычный key=value; key2=value2
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "\t" in line:
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    raw_items.append(
+                        {
+                            "name": parts[5].strip(),
+                            "value": parts[6].strip(),
+                            "domain": parts[0].strip() or ".ozon.by",
+                            "path": parts[2].strip() or "/",
+                            "secure": parts[3].strip().upper() == "TRUE",
+                        }
+                    )
+                    continue
+            for chunk in line.split(";"):
+                chunk = chunk.strip()
+                if "=" not in chunk:
+                    continue
+                k, v = chunk.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if not k or k.lower() in {"path", "domain", "expires", "max-age", "samesite", "secure", "httponly"}:
+                    continue
+                raw_items.append({"name": k, "value": v, "domain": ".ozon.by"})
+
+    normalized: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for item in raw_items:
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not name or value == "":
+            continue
+        is_secure = name.startswith("__Secure-") or bool(item.get("secure", True))
+        for target_domain in (".ozon.by", ".ozon.ru", ".ozon.kz"):
+            key_pair = (name, target_domain)
+            if key_pair in seen_pairs:
+                continue
+            seen_pairs.add(key_pair)
+            cookie_dict: dict[str, Any] = {
+                "name": name,
+                "value": value,
+                "domain": target_domain,
+                "path": str(item.get("path") or "/"),
+                "secure": is_secure,
+            }
+            if item.get("httpOnly") is not None:
+                cookie_dict["httpOnly"] = bool(item["httpOnly"])
+            normalized.append(cookie_dict)
+
+    return normalized
+
+
+def extract_ozon_auth_info(cookies: Iterable[dict[str, Any]]) -> tuple[bool, str]:
+    """Проверяет, содержат ли cookies авторизованную сессию аккаунта Ozon.
+    Возвращает (is_authenticated, user_id_or_details).
+    """
+    has_token = False
+    user_id = ""
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        val = str(c.get("value") or "").strip()
+        if not val or val in {"0", "null", "undefined", "deleted"}:
+            continue
+        if name in {"__Secure-access-token", "__Secure-refresh-token", "access_token", "refresh_token"} and len(val) > 16:
+            has_token = True
+        elif name == "__Secure-user-id" and val != "0":
+            user_id = val
+
+    if has_token or user_id:
+        label = f"ID {user_id}" if user_id else "токен активен"
+        return True, label
+    return False, ""
+
+
 class OzonBrowserResolver:
-    """Браузерный резолвер коротких ссылок и парсер карточек Ozon с обходом Variti antibot."""
+    """Браузерный резолвер ссылок и парсер карточек Ozon и Wildberries."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -2334,7 +2551,7 @@ class OzonBrowserResolver:
                 if idle_for >= self.settings.browser_idle_timeout:
                     async with self._lock:
                         if self._context is not None and (time.time() - self._last_used) >= self.settings.browser_idle_timeout:
-                            log("Закрытие браузера Ozon после простоя для освобождения памяти")
+                            log("Закрытие браузера после простоя для освобождения памяти")
                             await self._close_unlocked()
 
     async def _apply_cdp_stealth(self, page) -> None:
@@ -2453,12 +2670,13 @@ class OzonBrowserResolver:
                 await self._context.add_init_script(MINIMAL_STEALTH_SCRIPT)
                 init_page = self._context.pages[0] if self._context.pages else await self._context.new_page()
                 await self._apply_cdp_stealth(init_page)
-                log("Запущен Chromium (--headless=new + CDP native UA) для обхода антибота Ozon")
+                log("Запущен Chromium (--headless=new + CDP native UA) для парсинга маркетплейсов")
 
+            await self._inject_cached_cookies_unlocked()
             self._last_used = time.time()
             return True
         except Exception as exc:
-            log(f"Не удалось запустить браузер Playwright для Ozon: {type(exc).__name__}: {exc}", logging.WARNING)
+            log(f"Не удалось запустить браузер Playwright: {type(exc).__name__}: {exc}", logging.WARNING)
             await self._close_unlocked()
             return False
 
@@ -2589,6 +2807,175 @@ class OzonBrowserResolver:
                     log(f"In-page fetch ({page.url}): {debug_info}", logging.DEBUG)
         return None
 
+    async def fetch_wb_product_card(
+        self,
+        sku: str,
+        *,
+        rub_to_byn_rate: float = 0.0345,
+    ) -> ProductCardData | None:
+        """Открывает карточку Wildberries в браузере Chromium, перехватывая сетевые ответы API и читая DOM."""
+        if not self._available or not sku:
+            return None
+
+        async with self._lock:
+            if not await self._ensure_context():
+                return None
+
+            self._last_used = time.time()
+            assert self._context is not None
+            nav_page = await self._context.new_page()
+            await self._apply_cdp_stealth(nav_page)
+
+            intercepted_cards: list[ProductCardData] = []
+
+            async def _on_response(resp) -> None:
+                url_str = resp.url or ""
+                if resp.status != 200:
+                    return
+                if any(
+                    k in url_str
+                    for k in ("/cards/", "/detail", "/exactmatch/", "card.json")
+                ):
+                    with suppress(Exception):
+                        body_bytes = await resp.body()
+                        if not body_bytes:
+                            return
+                        data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                        if "card.json" in url_str and isinstance(data, dict):
+                            imt_name = str(data.get("imt_name") or data.get("subj_name") or "").strip()
+                            selling = data.get("selling")
+                            b_name = str(selling.get("brand_name") or "").strip() if isinstance(selling, dict) else ""
+                            if imt_name:
+                                intercepted_cards.append(
+                                    ProductCardData(
+                                        title=clean_product_title(imt_name, b_name),
+                                        brand=b_name,
+                                    )
+                                )
+                        elif isinstance(data, dict):
+                            curr = "BYN" if "curr=byn" in url_str.lower() else "RUB"
+                            parsed_c = parse_wb_detail_payload(
+                                data,
+                                target_sku=sku,
+                                currency=curr,
+                                rub_to_byn_rate=rub_to_byn_rate,
+                            )
+                            if parsed_c is not None:
+                                intercepted_cards.append(parsed_c)
+
+            nav_page.on("response", _on_response)
+
+            try:
+                for domain, default_curr in (("www.wildberries.by", "BYN"), ("www.wildberries.ru", "RUB")):
+                    target_url = f"https://{domain}/catalog/{sku}/detail.aspx"
+                    try:
+                        resp = await nav_page.goto(target_url, wait_until="domcontentloaded", timeout=12_000)
+                        if resp and resp.status == 404:
+                            return ProductCardData(in_stock=False)
+                    except Exception as exc:
+                        log(f"Ошибка навигации WB {target_url}: {exc}", logging.DEBUG)
+                        continue
+
+                    # Ждём до 4.5 секунд рендера цены или блока «Нет в наличии» непосредственно в DOM карточки
+                    deadline = time.monotonic() + 4.5
+                    while time.monotonic() < deadline:
+                        with suppress(Exception):
+                            has_dom_ready = await nav_page.evaluate(
+                                """() => {
+                                    const p = document.querySelector('ins.price-block__final-price, .price-block__final-price, [class*="price-block__final-price"], .sold-out-product');
+                                    return Boolean(p && p.innerText && p.innerText.trim().length > 0);
+                                }"""
+                            )
+                            if has_dom_ready:
+                                break
+                        if any(c.in_stock is False for c in intercepted_cards):
+                            break
+                        await asyncio.sleep(0.4)
+
+                    dom_info = None
+                    with suppress(Exception):
+                        dom_info = await nav_page.evaluate(
+                            """() => {
+                                const h1 = document.querySelector('.product-page__title, h1');
+                                const brandEl = document.querySelector('.product-page__header-brand, [class*="brand-name"]');
+                                const finalPriceEl = (
+                                    document.querySelector('ins.price-block__final-price') ||
+                                    document.querySelector('.price-block__final-price') ||
+                                    document.querySelector('[class*="price-block__final-price"]') ||
+                                    document.querySelector('.price-block__wallet-price')
+                                );
+                                const oldPriceEl = (
+                                    document.querySelector('del.price-block__old-price') ||
+                                    document.querySelector('.price-block__old-price') ||
+                                    document.querySelector('[class*="price-block__old-price"]')
+                                );
+                                const imgEl = document.querySelector('.photo-zoom__preview, .slide__content img, .product-page img');
+                                const soldOutEl = document.querySelector('.sold-out-product, [class*="sold-out"]');
+                                const bodyText = document.body ? document.body.innerText.slice(0, 20000) : '';
+                                return {
+                                    title: h1 ? h1.innerText.trim() : '',
+                                    brand: brandEl ? brandEl.innerText.trim() : '',
+                                    finalPrice: finalPriceEl ? finalPriceEl.innerText.trim() : '',
+                                    oldPrice: oldPriceEl ? oldPriceEl.innerText.trim() : '',
+                                    imgSrc: imgEl ? (imgEl.currentSrc || imgEl.src || '') : '',
+                                    soldOutText: soldOutEl ? soldOutEl.innerText.trim() : '',
+                                    bodyText: bodyText
+                                };
+                            }"""
+                        )
+
+                    combined_card: ProductCardData | None = None
+                    for ic in intercepted_cards:
+                        combined_card = merge_card_data(combined_card, ic)
+
+                    if isinstance(dom_info, dict):
+                        dom_title = clean_product_title(dom_info.get("title"), dom_info.get("brand"))
+                        raw_final = dom_info.get("finalPrice") or ""
+                        raw_old = dom_info.get("oldPrice") or ""
+                        val_f, curr_f = parse_price_value_and_currency(raw_final, default_currency=default_curr)
+                        price_byn = convert_to_byn(val_f, curr_f, rub_to_byn_rate)
+                        val_o, curr_o = parse_price_value_and_currency(raw_old, default_currency=default_curr)
+                        old_price_byn = convert_to_byn(val_o, curr_o, rub_to_byn_rate)
+
+                        sold_text = f"{dom_info.get('soldOutText') or ''}\n{dom_info.get('bodyText') or ''}".casefold()
+                        if price_byn is not None and price_byn > 0:
+                            dom_in_stock: bool | None = True
+                        elif any(m in sold_text for m in ("нет в наличии", "продано", "товар распродан")):
+                            dom_in_stock = False
+                        else:
+                            dom_in_stock = None
+
+                        dom_img = normalize_image_url(dom_info.get("imgSrc")) or get_wb_card_image_url(sku)
+                        dom_card = ProductCardData(
+                            title=dom_title,
+                            brand=str(dom_info.get("brand") or ""),
+                            price_byn=price_byn if dom_in_stock is not False else None,
+                            old_price_byn=old_price_byn if dom_in_stock is not False else None,
+                            avg_month_price_byn=None,
+                            image_url=dom_img,
+                            in_stock=dom_in_stock,
+                            raw_currency=curr_f or default_curr,
+                        )
+                        if dom_card.price_byn is not None:
+                            combined_card = merge_card_data(dom_card, combined_card)
+                        else:
+                            combined_card = merge_card_data(combined_card, dom_card)
+
+                    if combined_card and (
+                        combined_card.in_stock is False
+                        or (combined_card.title and combined_card.price_byn is not None)
+                    ):
+                        log(
+                            f"Карточка WB {sku} получена через браузер ({domain}): "
+                            f"in_stock={combined_card.in_stock}, price={combined_card.price_byn} BYN"
+                        )
+                        return combined_card
+
+                return None
+            finally:
+                with suppress(Exception):
+                    await nav_page.close()
+
     async def fetch_product_card(
         self,
         sku: str,
@@ -2674,7 +3061,6 @@ class OzonBrowserResolver:
                                     )
                                     return inpage_card, cookies
 
-                # Открываем страницу товара во вкладке для извлечения DOM / попапа «Стало дешевле» / фото
                 assert self._context is not None
                 nav_page = await self._context.new_page()
                 await self._apply_cdp_stealth(nav_page)
@@ -2687,7 +3073,6 @@ class OzonBrowserResolver:
 
                     await asyncio.sleep(0.8)
 
-                    # Если на странице есть кнопка «Стало дешевле», кликаем по ней, чтобы открыть попап со «Средняя за <месяц>»
                     with suppress(Exception):
                         cheaper_el = await nav_page.query_selector("text=Стало дешевле")
                         if cheaper_el:
@@ -2701,7 +3086,6 @@ class OzonBrowserResolver:
                         rub_to_byn_rate=rub_to_byn_rate,
                     )
 
-                    # Дополнительно проверяем видимый текст страницы и главное фото галереи через JS
                     with suppress(Exception):
                         dom_extra = await nav_page.evaluate(
                             """() => {
@@ -2760,6 +3144,159 @@ class OzonBrowserResolver:
 
             cookies = await self._export_cookies()
             return None, cookies
+
+    async def _inject_cached_cookies_unlocked(self) -> None:
+        """Загружает сохранённые cookies аккаунта Ozon из файла/окружения в контекст браузера Playwright."""
+        if self._context is None:
+            return
+        cookies_to_add: list[dict[str, Any]] = []
+        raw_env = os.getenv("OZON_COOKIES", "").strip()
+        if raw_env:
+            cookies_to_add.extend(parse_ozon_cookies_input(raw_env))
+        if os.path.isfile(self.settings.cookies_cache_path):
+            with suppress(Exception):
+                with open(self.settings.cookies_cache_path, "r", encoding="utf-8") as f:
+                    raw_file = f.read()
+                cookies_to_add.extend(parse_ozon_cookies_input(raw_file))
+        if not cookies_to_add:
+            return
+        pw_cookies: list[dict[str, Any]] = []
+        for c in cookies_to_add:
+            if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
+                continue
+            pw_c: dict[str, Any] = {
+                "name": str(c["name"]),
+                "value": str(c["value"]),
+                "domain": str(c.get("domain") or ".ozon.by"),
+                "path": str(c.get("path") or "/"),
+                "secure": bool(c.get("secure", True)),
+            }
+            pw_cookies.append(pw_c)
+        if pw_cookies:
+            with suppress(Exception):
+                await self._context.add_cookies(pw_cookies)
+
+    async def import_cookies(self, new_cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Сохраняет новые cookies аккаунта Ozon на диск и внедряет их в живой браузерный контекст."""
+        if not new_cookies:
+            return []
+        async with self._lock:
+            existing: list[dict[str, Any]] = []
+            if os.path.isfile(self.settings.cookies_cache_path):
+                with suppress(Exception):
+                    with open(self.settings.cookies_cache_path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        existing = [c for c in loaded if isinstance(c, dict)]
+
+            merged_map: dict[tuple[str, str], dict[str, Any]] = {}
+            for c in existing:
+                name = str(c.get("name") or "").strip()
+                dom = str(c.get("domain") or ".ozon.by").strip()
+                if name:
+                    merged_map[(name, dom)] = c
+            for c in new_cookies:
+                name = str(c.get("name") or "").strip()
+                dom = str(c.get("domain") or ".ozon.by").strip()
+                if name:
+                    merged_map[(name, dom)] = c
+
+            merged_list = list(merged_map.values())
+            self.last_cookies = merged_list
+            os.makedirs(os.path.dirname(self.settings.cookies_cache_path) or ".", exist_ok=True)
+            with suppress(OSError):
+                with open(self.settings.cookies_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(merged_list, f, ensure_ascii=False)
+
+            if self._context is not None:
+                await self._inject_cached_cookies_unlocked()
+                # Сбрасываем прогретые вкладки, чтобы следующий запрос шёл уже от имени аккаунта
+                for page in list(self._warm_pages.values()):
+                    with suppress(Exception):
+                        await page.close()
+                self._warm_pages.clear()
+
+            return merged_list
+
+    async def clear_cookies(self) -> None:
+        """Очищает сохранённые cookies аккаунта Ozon."""
+        async with self._lock:
+            self.last_cookies = []
+            with suppress(OSError):
+                if os.path.isfile(self.settings.cookies_cache_path):
+                    os.remove(self.settings.cookies_cache_path)
+            if self._context is not None:
+                with suppress(Exception):
+                    await self._context.clear_cookies()
+                for page in list(self._warm_pages.values()):
+                    with suppress(Exception):
+                        await page.close()
+                self._warm_pages.clear()
+
+    async def interactive_login(self, start_url: str = "https://ozon.by/") -> list[dict[str, Any]]:
+        """Открывает видимое окно браузера Chromium (--login-ozon) для однократного входа в аккаунт Ozon."""
+        if async_playwright_factory is None:
+            raise RuntimeError("Playwright не установлен. Установите: pip install playwright && playwright install chromium")
+
+        os.makedirs(self.settings.browser_profile_dir, exist_ok=True)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _ensure_playwright_browser_installed)
+
+        pw = await async_playwright_factory().start()
+        context = None
+        try:
+            launch_kwargs: dict[str, Any] = {
+                "user_data_dir": self.settings.browser_profile_dir,
+                "headless": False,
+                "viewport": {"width": 1280, "height": 900},
+                "locale": "ru-RU",
+                "timezone_id": "Europe/Minsk",
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ],
+            }
+            exec_path = _find_system_chromium()
+            if exec_path:
+                launch_kwargs["executable_path"] = exec_path
+            if self.settings.ozon_proxy:
+                launch_kwargs["proxy"] = {"server": self.settings.ozon_proxy}
+
+            context = await pw.chromium.launch_persistent_context(**launch_kwargs)
+            await context.add_init_script(MINIMAL_STEALTH_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+            log(f"Открыто окно браузера: {start_url} — войдите в аккаунт Ozon (после входа окно закроется автоматически)")
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=30_000)
+
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                if page.is_closed():
+                    break
+                with suppress(Exception):
+                    cookies = await context.cookies()
+                    is_auth, label = extract_ozon_auth_info(cookies)
+                    if is_auth:
+                        log(f"Обнаружен успешный вход в аккаунт Ozon ({label})! Сохраняем сессию...")
+                        await asyncio.sleep(2.0)
+                        cookies = await context.cookies()
+                        expanded = parse_ozon_cookies_input(json.dumps(cookies, ensure_ascii=False)) or cookies
+                        with open(self.settings.cookies_cache_path, "w", encoding="utf-8") as f:
+                            json.dump(expanded, f, ensure_ascii=False)
+                        return expanded
+                await asyncio.sleep(1.0)
+
+            cookies = await context.cookies()
+            if cookies:
+                with open(self.settings.cookies_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cookies, f, ensure_ascii=False)
+            return cookies
+        finally:
+            if context is not None:
+                with suppress(Exception):
+                    await context.close()
+            with suppress(Exception):
+                await pw.stop()
 
     async def _export_cookies(self) -> list[dict]:
         if self._context is None:
@@ -2973,9 +3510,16 @@ class ParserApp:
         self.album_tasks: dict[int, asyncio.Task] = {}
         self.album_lock = asyncio.Lock()
         self.synced_cookie_count: int = 0
+        self.ozon_auth_active: bool = False
+        self.ozon_auth_label: str = ""
+        self._awaiting_ozon_cookies: bool = False
         self._rub_to_byn_rate: float = settings.rub_to_byn_fallback_rate
         self._rate_updated_at: float = 0.0
         self._rate_lock = asyncio.Lock()
+        self._wb_minsk_dest: int = settings.wb_dest_byn
+        self._wb_minsk_xinfo: str = ""
+        self._wb_geo_updated_at: float = 0.0
+        self._wb_geo_lock = asyncio.Lock()
         self._register_admin_handlers()
 
     async def get_rub_to_byn_rate(self) -> float:
@@ -3006,50 +3550,64 @@ class ParserApp:
             return self._rub_to_byn_rate
 
     def _sync_cookies_to_http_clients(self, cookies: list[dict]) -> None:
-        """Переносит антибот-cookies (abt_data, __Secure-ab-group, xcid, rfuid) из браузера в curl_cffi и aiohttp."""
+        """Переносит сессионные и авторизационные cookies Ozon (__Secure-access-token, __Secure-refresh-token,
+        __Secure-user-id, abt_data, xcid) в curl_cffi и aiohttp для получения персональных цен аккаунта."""
         if not cookies:
             return
-        synced = 0
+        unique_names: set[str] = set()
         for cookie in cookies:
-            name = cookie.get("name")
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").strip()
             value = cookie.get("value")
-            domain = (cookie.get("domain") or "").lstrip(".")
+            domain = str(cookie.get("domain") or "").lstrip(".")
             if not name or value is None:
                 continue
-            synced += 1
+            val_str = str(value)
+            unique_names.add(name)
             if self.curl_session is not None:
                 with suppress(Exception):
-                    self.curl_session.cookies.set(name, value, domain=domain or "ozon.by")
+                    self.curl_session.cookies.set(name, val_str, domain=domain or "ozon.by")
                 for oz_domain in OZON_DOMAINS:
-                    with suppress(Exception):
-                        self.curl_session.cookies.set(name, value, domain=oz_domain)
+                    for prefix in ("", ".", "www.", "api."):
+                        with suppress(Exception):
+                            self.curl_session.cookies.set(name, val_str, domain=f"{prefix}{oz_domain}")
             if self.http_session is not None:
                 for oz_domain in OZON_DOMAINS:
-                    with suppress(Exception):
-                        self.http_session.cookie_jar.update_cookies(
-                            {name: value},
-                            response_url=aiohttp.client.URL(f"https://www.{oz_domain}/"),
-                        )
-        if synced:
-            self.synced_cookie_count = synced
+                    for sub in (f"https://{oz_domain}/", f"https://www.{oz_domain}/", f"https://api.{oz_domain}/"):
+                        with suppress(Exception):
+                            self.http_session.cookie_jar.update_cookies(
+                                {name: val_str},
+                                response_url=aiohttp.client.URL(sub),
+                            )
+        if unique_names:
+            self.synced_cookie_count = len(unique_names)
+        is_auth, auth_label = extract_ozon_auth_info(cookies)
+        if is_auth:
+            self.ozon_auth_active = True
+            self.ozon_auth_label = auth_label
 
     def _load_cached_cookies_from_disk(self) -> None:
+        combined: list[dict[str, Any]] = []
         raw_env_cookies = os.getenv("OZON_COOKIES", "").strip()
         if raw_env_cookies:
-            env_list: list[dict] = []
-            for part in raw_env_cookies.split(";"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    env_list.append({"name": k.strip(), "value": v.strip(), "domain": "ozon.by"})
-            self._sync_cookies_to_http_clients(env_list)
+            combined.extend(parse_ozon_cookies_input(raw_env_cookies))
 
         if os.path.isfile(self.settings.cookies_cache_path):
             with suppress(Exception):
                 with open(self.settings.cookies_cache_path, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                if isinstance(cached, list) and cached:
-                    self._sync_cookies_to_http_clients(cached)
-                    log(f"Загружено {len(cached)} кэшированных антибот-cookies Ozon с диска")
+                    raw_disk = f.read()
+                parsed_disk = parse_ozon_cookies_input(raw_disk)
+                if parsed_disk:
+                    combined.extend(parsed_disk)
+
+        if combined:
+            self._sync_cookies_to_http_clients(combined)
+            with suppress(OSError):
+                with open(self.settings.cookies_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(combined, f, ensure_ascii=False)
+            auth_status = f"авторизован ({self.ozon_auth_label})" if self.ozon_auth_active else "гостевой режим"
+            log(f"Загружены cookies Ozon ({self.synced_cookie_count} ключей, статус: {auth_status})")
 
     async def host_has_only_public_ips(self, hostname: str) -> bool:
         """Дополнительная защита от SSRF; allowlist доменов проверяется отдельно."""
@@ -3076,30 +3634,47 @@ class ParserApp:
         return None
 
     async def _fetch_json_any(self, url: str, headers: dict[str, str] | None = None) -> Any:
-        """Выполняет GET-запрос и возвращает распарсенный JSON (dict или list) через curl_cffi или aiohttp."""
-        req_headers = dict(headers or DEFAULT_HEADERS)
-        req_headers.setdefault("Accept", "application/json, text/plain, */*")
+        """Выполняет GET-запрос и возвращает распарсенный JSON (dict или list) через curl_cffi или aiohttp.
 
+        Важно для Wildberries и Ozon: при использовании curl_cffi(impersonate="chrome") не перезаписываем
+        его нативный User-Agent и Sec-CH-UA дефолтными заголовками, чтобы не ломать совпадение TLS-фингерпринта.
+        """
         if self.curl_session is not None:
-            with suppress(Exception):
-                async with self.resolve_semaphore:
-                    resp = await self.curl_session.get(
-                        url,
-                        headers=req_headers,
-                        allow_redirects=True,
-                        timeout=self.settings.request_timeout_seconds,
-                    )
-                    if resp.status_code == 404:
-                        return {"_http_status": 404}
-                    if 200 <= resp.status_code < 300 and resp.content:
-                        return json.loads(resp.content.decode("utf-8", errors="ignore"))
+            curl_headers: dict[str, str] = {
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+            if headers:
+                for k, v in headers.items():
+                    if k.lower() not in {"user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"} or "ozonapp" in v:
+                        curl_headers[k] = v
+
+            for attempt in range(2):
+                with suppress(Exception):
+                    async with self.resolve_semaphore:
+                        resp = await self.curl_session.get(
+                            url,
+                            headers=curl_headers,
+                            allow_redirects=True,
+                            timeout=self.settings.request_timeout_seconds,
+                        )
+                        if resp.status_code == 404:
+                            return {"_http_status": 404}
+                        if resp.status_code == 429 and attempt == 0:
+                            await asyncio.sleep(1.2)
+                            continue
+                        if 200 <= resp.status_code < 300 and resp.content:
+                            return json.loads(resp.content.decode("utf-8", errors="ignore"))
+                break
 
         if self.http_session is not None:
+            aio_headers = dict(headers or DEFAULT_HEADERS)
+            aio_headers.setdefault("Accept", "application/json, text/plain, */*")
             with suppress(Exception):
                 async with self.resolve_semaphore:
                     async with self.http_session.get(
                         url,
-                        headers=req_headers,
+                        headers=aio_headers,
                         allow_redirects=True,
                     ) as resp:
                         if resp.status == 404:
@@ -3120,7 +3695,6 @@ class ParserApp:
             return None
 
         img_headers = {
-            "User-Agent": BROWSER_USER_AGENT,
             "Accept": "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
             "Accept-Language": "ru-RU,ru;q=0.9",
         }
@@ -3144,7 +3718,7 @@ class ParserApp:
                 async with self.resolve_semaphore:
                     async with self.http_session.get(
                         clean_url,
-                        headers=img_headers,
+                        headers={**DEFAULT_HEADERS, **img_headers},
                         allow_redirects=True,
                     ) as resp:
                         if 200 <= resp.status < 300:
@@ -3155,46 +3729,133 @@ class ParserApp:
 
         return None
 
+    async def _discover_wb_basket_card(self, sku_int: int) -> tuple[str, dict[str, Any] | None]:
+        """Находит рабочий сервер корзины Wildberries (basket-XX.wbbasket.ru) и загружает card.json.
+
+        Если расчётный шард вернул 404 (например, для новых 9-10-значных артикулов),
+        проверяет соседние и новые шарды корзин и кэширует найденный хост для vol.
+        """
+        vol = sku_int // 100_000
+        part = sku_int // 1_000
+
+        req_headers = {
+            "Accept": "application/json",
+            "Referer": f"https://www.wildberries.ru/catalog/{sku_int}/detail.aspx",
+        }
+
+        primary_host = get_wb_basket_host(vol)
+        primary_url = f"https://{primary_host}/vol{vol}/part{part}/{sku_int}/info/ru/card.json"
+        data = await self._fetch_json_url(primary_url, headers=req_headers)
+        if isinstance(data, dict) and data.get("_http_status") != 404 and (data.get("imt_name") or data.get("subj_name")):
+            WB_BASKET_CACHE[vol] = primary_host
+            return primary_host, data
+
+        # Если расчётный баскет не подошёл — формируем список кандидатов вокруг расчётного и среди новых шардов (26..48)
+        guessed_num = get_wb_basket_shard_number(vol)
+        candidate_nums: list[int] = []
+        for delta in (-2, -1, 1, 2, 3, -3, 4, 5, 6):
+            n = guessed_num + delta
+            if 1 <= n <= 50 and n != guessed_num:
+                candidate_nums.append(n)
+        for n in range(28, 49):
+            if n not in candidate_nums and n != guessed_num:
+                candidate_nums.append(n)
+
+        # Проверяем кандидатов небольшими пакетами по 5 штук
+        for i in range(0, min(len(candidate_nums), 15), 5):
+            batch = candidate_nums[i:i + 5]
+            hosts = [f"basket-{n:02d}.wbbasket.ru" for n in batch]
+            urls = [f"https://{h}/vol{vol}/part{part}/{sku_int}/info/ru/card.json" for h in hosts]
+            results = await asyncio.gather(
+                *(self._fetch_json_url(u, headers=req_headers) for u in urls),
+                return_exceptions=True,
+            )
+            for h, res in zip(hosts, results):
+                if isinstance(res, dict) and res.get("_http_status") != 404 and (res.get("imt_name") or res.get("subj_name")):
+                    WB_BASKET_CACHE[vol] = h
+                    return h, res
+
+        return primary_host, None
+
+    async def get_wb_minsk_geo_info(self) -> tuple[int, str]:
+        """Получает актуальные гео-параметры Wildberries для Минска (Беларусь, BYN) через user-geo-data.wildberries.ru."""
+        now = time.time()
+        if self._wb_geo_updated_at > 0 and (now - self._wb_geo_updated_at) < 21600:
+            return self._wb_minsk_dest, self._wb_minsk_xinfo
+
+        async with self._wb_geo_lock:
+            if self._wb_geo_updated_at > 0 and (time.time() - self._wb_geo_updated_at) < 21600:
+                return self._wb_minsk_dest, self._wb_minsk_xinfo
+
+            geo_urls = (
+                "https://user-geo-data.wildberries.ru/get-geo-info"
+                "?currency=BYN&latitude=53.902284&longitude=27.561831&locale=ru&address=%D0%9C%D0%B8%D0%BD%D1%81%D0%BA",
+                "https://user-geo-data.wildberries.ru/get-geo-info"
+                "?currency=BYN&latitude=53.902284&longitude=27.561831&locale=by&address=%D0%9C%D0%B8%D0%BD%D1%81%D0%BA",
+            )
+            geo_headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://www.wildberries.by/",
+            }
+            for g_url in geo_urls:
+                data = await self._fetch_json_url(g_url, headers=geo_headers)
+                if not isinstance(data, dict):
+                    continue
+                xinfo = str(data.get("xinfo") or "").strip().lstrip("?")
+                dest_val = data.get("dest")
+                if dest_val is None and xinfo:
+                    qs = parse_qs(xinfo)
+                    if "dest" in qs and qs["dest"]:
+                        dest_val = qs["dest"][0]
+                with suppress(TypeError, ValueError):
+                    if dest_val is not None:
+                        first_dest = str(dest_val).split(",")[0].strip()
+                        self._wb_minsk_dest = int(first_dest)
+                        if xinfo:
+                            xinfo = re.sub(r"(?:^|&)curr=[^&]*", "", xinfo).strip("&")
+                            xinfo = f"curr=byn&{xinfo}" if xinfo else f"appType=1&curr=byn&dest={self._wb_minsk_dest}&spp={self.settings.wb_spp}"
+                        self._wb_minsk_xinfo = xinfo
+                        self._wb_geo_updated_at = time.time()
+                        log(f"Обновлены гео-параметры WB для Минска (BYN): dest={self._wb_minsk_dest}, xinfo={self._wb_minsk_xinfo}")
+                        return self._wb_minsk_dest, self._wb_minsk_xinfo
+
+            self._wb_geo_updated_at = time.time()
+            return self._wb_minsk_dest, self._wb_minsk_xinfo
+
     async def _fetch_wb_basket_card_extras(
         self,
         sku: str,
         *,
         rub_to_byn_rate: float = 0.0345,
-    ) -> tuple[str, str, float | None, str]:
+    ) -> tuple[str, str, float | None, float | None, str]:
         """Получает с сервера корзины Wildberries:
         - полное название и бренд (info/ru/card.json)
-        - среднюю цену за месяц (info/price-history.json)
+        - последнюю цену из истории на случай недоступности живого API (info/price-history.json)
         - ссылку на главное фото карточки товара (images/big/1.webp)
+        Примечание: на Wildberries нет вкладки «средняя цена за месяц», поэтому avg_month_price_byn всегда None.
         """
         try:
             sku_int = int(sku)
         except ValueError:
-            return "", "", None, ""
+            return "", "", None, None, ""
 
         vol = sku_int // 100_000
         part = sku_int // 1_000
-        basket_host = get_wb_basket_host(vol)
+        basket_host, card_data = await self._discover_wb_basket_card(sku_int)
         base_path = f"https://{basket_host}/vol{vol}/part{part}/{sku_int}"
-        card_json_url = f"{base_path}/info/ru/card.json"
         history_json_url = f"{base_path}/info/price-history.json"
         image_url = f"{base_path}/images/big/1.webp"
 
         req_headers = {
-            "User-Agent": BROWSER_USER_AGENT,
             "Accept": "application/json",
-            "Origin": "https://www.wildberries.by",
             "Referer": f"https://www.wildberries.by/catalog/{sku_int}/detail.aspx",
         }
 
-        card_data, history_data = await asyncio.gather(
-            self._fetch_json_url(card_json_url, headers=req_headers),
-            self._fetch_json_any(history_json_url, headers=req_headers),
-            return_exceptions=True,
-        )
+        history_data = await self._fetch_json_any(history_json_url, headers=req_headers)
 
         title = ""
         brand_name = ""
-        if isinstance(card_data, dict) and card_data.get("_http_status") != 404:
+        if isinstance(card_data, dict):
             imt_name = str(card_data.get("imt_name") or card_data.get("subj_name") or "").strip()
             selling = card_data.get("selling")
             if isinstance(selling, dict):
@@ -3203,85 +3864,203 @@ class ParserApp:
                 brand_name = str(card_data.get("brand_name") or "").strip()
             title = clean_product_title(imt_name, brand_name)
 
-        avg_month_price_byn = None
+        latest_history_price_byn = None
         if isinstance(history_data, list):
-            avg_month_price_byn = parse_wb_price_history_avg(
+            _, latest_history_price_byn = parse_wb_price_history_stats(
                 history_data,
                 rub_to_byn_rate=rub_to_byn_rate,
             )
 
-        return title, brand_name, avg_month_price_byn, image_url
+        return title, brand_name, None, latest_history_price_byn, image_url
 
     async def fetch_wb_card_data(self, sku: str, messages: Iterable = ()) -> ProductCardData | None:
-        """Парсит карточку товара Wildberries: название, актуальная цена в BYN, средняя цена за месяц, фото и наличие."""
+        """Парсит карточку товара Wildberries для региона Минск (BYN) через многоуровневый каскад:
+        1) Статический CDN корзин wbbasket.ru (полное название, бренд, главное фото)
+        2) Поисковые шарды u-search.wb.ru / search.wb.ru и детальные API card.wb.ru / u-card.wb.ru
+           с приоритетом региона Минск (dest=-59208 / user-geo-data) и валюты BYN
+        3) Браузерный резолвер Playwright (чтение цены напрямую с витрины wildberries.by / wildberries.ru)
+        4) Фолбэк на центральный склад (-1257786), превью Telegram и price-history.json
+        """
         rub_rate = await self.get_rub_to_byn_rate()
+        minsk_dest, minsk_xinfo = await self.get_wb_minsk_geo_info()
         wb_headers = {
-            "User-Agent": BROWSER_USER_AGENT,
             "Accept": "*/*",
             "Accept-Language": "ru-RU,ru;q=0.9",
-            "Origin": "https://www.wildberries.by",
             "Referer": f"https://www.wildberries.by/catalog/{sku}/detail.aspx",
         }
 
-        dest_candidates = (self.settings.wb_dest_byn, -59208, -59202, -1257786)
-        unique_dests = list(dict.fromkeys(dest_candidates))
+        # Шаг 1: Получаем метаданные с wbbasket.ru (точное название, бренд и главное фото)
+        basket_title, basket_brand, _, latest_hist_byn, basket_img = await self._fetch_wb_basket_card_extras(
+            sku,
+            rub_to_byn_rate=rub_rate,
+        )
 
         card_data: ProductCardData | None = None
+        if basket_title or basket_img:
+            card_data = ProductCardData(
+                title=basket_title,
+                brand=basket_brand,
+                avg_month_price_byn=None,
+                image_url=basket_img,
+            )
 
-        for api_ver in ("v2", "v4", "v1"):
-            for dest in unique_dests:
-                detail_url = (
-                    f"https://card.wb.ru/cards/{api_ver}/detail"
-                    f"?appType=1&curr=byn&dest={dest}&spp={self.settings.wb_spp}&nm={sku}"
-                )
-                payload = await self._fetch_json_url(detail_url, headers=wb_headers)
+        explicitly_out_of_stock = False
+        card_hosts = ("card.wb.ru", "u-card.wb.ru")
+        api_paths = ("cards/v4/detail", "cards/v2/detail", "cards/detail", "cards/v1/detail")
+
+        # Если получена строка xinfo от гео-сервиса WB для Минска — сначала делаем запрос с ней (1-в-1 как фронтенд WB)
+        if minsk_xinfo:
+            xinfo_urls = (
+                f"https://card.wb.ru/cards/v4/detail?{minsk_xinfo}&nm={sku}",
+                f"https://u-card.wb.ru/cards/v4/detail?{minsk_xinfo}&nm={sku}",
+                f"https://card.wb.ru/cards/v2/detail?{minsk_xinfo}&nm={sku}",
+                f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?{minsk_xinfo}&inheritFilters=false&lang=ru&page=1&query={sku}&resultset=catalog&sort=popular&suppressSpellcheck=false",
+            )
+            for x_url in xinfo_urls:
+                payload = await self._fetch_json_url(x_url, headers=wb_headers)
                 if not payload or payload.get("_http_status") == 404:
                     continue
                 parsed = parse_wb_detail_payload(
                     payload,
+                    target_sku=sku,
                     currency="BYN",
                     rub_to_byn_rate=rub_rate,
                 )
                 if parsed is not None:
-                    card_data = merge_card_data(card_data, parsed)
-                    if card_data.in_stock is False or (card_data.title and card_data.price_byn is not None):
-                        break
-            if card_data and (card_data.in_stock is False or (card_data.title and card_data.price_byn is not None)):
-                break
+                    card_data = replace(merge_card_data(card_data, parsed), avg_month_price_byn=None)
+                    if card_data and card_data.in_stock is True and card_data.price_byn is not None:
+                        log(f"Карточка WB {sku} получена с гео-параметрами Минска (xinfo): price={card_data.price_byn} BYN")
+                        return card_data
 
-        if card_data is None or (card_data.in_stock is not False and card_data.price_byn is None):
-            rub_url = (
-                f"https://card.wb.ru/cards/v2/detail"
-                f"?appType=1&curr=rub&dest=-1257786&spp={self.settings.wb_spp}&nm={sku}"
-            )
-            payload_rub = await self._fetch_json_url(rub_url, headers=wb_headers)
-            if payload_rub and payload_rub.get("_http_status") != 404:
-                parsed_rub = parse_wb_detail_payload(
-                    payload_rub,
-                    currency="RUB",
-                    rub_to_byn_rate=rub_rate,
-                )
-                card_data = merge_card_data(card_data, parsed_rub)
+        # Сначала проверяем белорусские регионы доставки (Минск: -59208, 123585595),
+        # чтобы получить точную белорусскую цену с учётом логистики до РБ (например, 5,68 BYN вместо 4,96 BYN).
+        # Центральный склад РФ (-1257786) используем только как резервный фолбэк.
+        belarus_dests = list(dict.fromkeys((minsk_dest, self.settings.wb_dest_byn, -59208, 123585595)))
+        belarus_dests = [d for d in belarus_dests if d != -1257786] or [-59208]
+        all_dest_groups = (
+            ("byn", belarus_dests),
+            ("byn", [-1257786]),
+            ("rub", belarus_dests[:1] + [-1257786]),
+        )
 
-        # Если товар в наличии, подтягиваем среднюю цену за месяц, полное имя и фото с сервера корзины WB
-        if card_data is None or card_data.in_stock is not False:
-            basket_title, basket_brand, avg_month_byn, basket_img = await self._fetch_wb_basket_card_extras(
+        for curr, dest_list in all_dest_groups:
+            for dest in dest_list:
+                # 2а) Детальные эндпоинты карточки card.wb.ru / u-card.wb.ru с региональным dest
+                for api_path in api_paths[:2]:
+                    for host in card_hosts:
+                        detail_url = (
+                            f"https://{host}/{api_path}"
+                            f"?appType=1&curr={curr}&dest={dest}&spp={self.settings.wb_spp}&nm={sku}"
+                        )
+                        payload = await self._fetch_json_url(detail_url, headers=wb_headers)
+                        if not payload or payload.get("_http_status") == 404:
+                            continue
+                        parsed = parse_wb_detail_payload(
+                            payload,
+                            target_sku=sku,
+                            currency=curr.upper(),
+                            rub_to_byn_rate=rub_rate,
+                        )
+                        if parsed is not None:
+                            if parsed.in_stock is False and dest == -1257786:
+                                explicitly_out_of_stock = True
+                            card_data = replace(merge_card_data(card_data, parsed), avg_month_price_byn=None)
+                            if card_data and card_data.in_stock is True and card_data.price_byn is not None:
+                                log(
+                                    f"Карточка WB {sku} получена через {host}/{api_path} ({curr.upper()}, dest={dest}): "
+                                    f"price={card_data.price_byn} BYN"
+                                )
+                                return card_data
+
+                # 2б) Поисковые шарды u-search.wb.ru / search.wb.ru с тем же региональным dest
+                for shard in WB_SEARCH_SHARDS[:3]:
+                    search_urls = (
+                        f"https://u-search.wb.ru/exactmatch/ru/{shard}/v18/search"
+                        f"?ab_testid=new_benefit_sort&appType=1&curr={curr}&dest={dest}"
+                        f"&inheritFilters=false&lang=ru&page=1&query={sku}&resultset=catalog"
+                        f"&sort=popular&spp={self.settings.wb_spp}&suppressSpellcheck=false",
+                        f"https://search.wb.ru/exactmatch/ru/{shard}/v18/search"
+                        f"?appType=1&curr={curr}&dest={dest}&lang=ru&page=1&query={sku}"
+                        f"&resultset=catalog&sort=popular&spp={self.settings.wb_spp}",
+                    )
+                    for s_url in search_urls:
+                        payload = await self._fetch_json_url(s_url, headers=wb_headers)
+                        if not payload or payload.get("_http_status") == 404:
+                            continue
+                        parsed = parse_wb_detail_payload(
+                            payload,
+                            target_sku=sku,
+                            currency=curr.upper(),
+                            rub_to_byn_rate=rub_rate,
+                        )
+                        if parsed is not None:
+                            if parsed.in_stock is False and dest == -1257786:
+                                explicitly_out_of_stock = True
+                            card_data = replace(merge_card_data(card_data, parsed), avg_month_price_byn=None)
+                            if card_data and card_data.in_stock is True and card_data.price_byn is not None:
+                                log(
+                                    f"Карточка WB {sku} получена через search API ({shard}, {curr.upper()}, dest={dest}): "
+                                    f"price={card_data.price_byn} BYN"
+                                )
+                                return card_data
+
+        # Шаг 3: Если HTTP API не отдали цену, открываем карточку WB в браузере Playwright Chromium
+        if self.browser_resolver.is_available and (card_data is None or card_data.price_byn is None):
+            browser_wb_card = await self.browser_resolver.fetch_wb_product_card(
                 sku,
                 rub_to_byn_rate=rub_rate,
             )
-            extras_card = ProductCardData(
-                title=basket_title,
-                brand=basket_brand,
-                avg_month_price_byn=avg_month_byn,
-                image_url=basket_img,
-            )
-            card_data = merge_card_data(card_data, extras_card)
+            if browser_wb_card is not None:
+                if browser_wb_card.in_stock is False:
+                    return replace(
+                        merge_card_data(card_data, browser_wb_card) or browser_wb_card,
+                        in_stock=False,
+                        price_byn=None,
+                        avg_month_price_byn=None,
+                    )
+                card_data = replace(merge_card_data(card_data, browser_wb_card), avg_month_price_byn=None)
+                if card_data and card_data.price_byn is not None:
+                    return card_data
 
-        if card_data is None or (card_data.in_stock is not False and (not card_data.title or card_data.price_byn is None)):
+        # Шаг 4: Проверяем Telegram WebPage-превью
+        if card_data is None or card_data.price_byn is None:
             wp_obj = match_message_webpage_obj(messages, "", sku, 1)
             if wp_obj:
                 wp_card = parse_webpage_preview_card(wp_obj, default_currency="BYN", rub_to_byn_rate=rub_rate)
-                card_data = merge_card_data(card_data, wp_card)
+                if wp_card is not None:
+                    if wp_card.in_stock is False:
+                        explicitly_out_of_stock = True
+                    card_data = replace(merge_card_data(card_data, wp_card), avg_month_price_byn=None)
+
+        # Шаг 5: Резервный фолбэк на последнюю цену из price-history.json (без средней цены за месяц)
+        if (
+            not explicitly_out_of_stock
+            and (card_data is None or card_data.price_byn is None)
+            and latest_hist_byn is not None
+            and latest_hist_byn > 0
+            and basket_title
+        ):
+            log(
+                f"Для WB {sku} использована последняя цена из price-history.json: {latest_hist_byn} BYN"
+            )
+            fallback_hist_card = ProductCardData(
+                title=basket_title,
+                brand=basket_brand,
+                price_byn=latest_hist_byn,
+                avg_month_price_byn=None,
+                image_url=basket_img,
+                in_stock=True,
+                raw_currency="BYN",
+            )
+            card_data = replace(merge_card_data(card_data, fallback_hist_card), avg_month_price_byn=None)
+
+        if explicitly_out_of_stock and (card_data is None or card_data.price_byn is None):
+            return ProductCardData(
+                title=basket_title,
+                brand=basket_brand,
+                image_url=basket_img,
+                in_stock=False,
+            )
 
         return card_data
 
@@ -3298,11 +4077,38 @@ class ParserApp:
 
         card_data: ProductCardData | None = None
 
-        # 1. Пробуем JSON API Ozon (entrypoint-api / composer-api) на витрине ozon.by
         storefronts = ["ozon.by"]
         for d in self.settings.ozon_preferred_storefronts:
             if d not in storefronts:
                 storefronts.append(d)
+
+        # Если привязан аккаунт Ozon и доступен браузерный резолвер — сначала запрашиваем карточку
+        # через авторизованный контекст браузера (он автоматически продлевает __Secure-access-token
+        # через __Secure-refresh-token и отдаёт персональную цену аккаунта со скидкой Ozon).
+        if self.ozon_auth_active and self.browser_resolver.is_available:
+            browser_card, fresh_cookies = await self.browser_resolver.fetch_product_card(
+                sku,
+                rub_to_byn_rate=rub_rate,
+            )
+            if fresh_cookies:
+                self._sync_cookies_to_http_clients(fresh_cookies)
+            if browser_card is not None:
+                if browser_card.in_stock is False and browser_card.price_byn is None:
+                    return browser_card
+                card_data = merge_card_data(card_data, browser_card)
+                if (
+                    card_data.title
+                    and card_data.price_byn is not None
+                    and card_data.image_url
+                    and card_data.avg_month_price_byn is not None
+                ):
+                    return card_data
+
+        header_variants = (
+            (OZON_WEB_HEADERS, OZON_APP_HEADERS)
+            if self.ozon_auth_active
+            else (OZON_APP_HEADERS, OZON_WEB_HEADERS)
+        )
 
         for host in storefronts:
             default_curr = "BYN" if host == "ozon.by" else "RUB"
@@ -3311,30 +4117,30 @@ class ParserApp:
                 f"https://api.{host}/composer-api.bx/page/json/v2?url={encoded_path}",
                 f"https://www.{host}/api/composer-api.bx/page/json/v2?url={encoded_path}",
             )
-            for ep_url in endpoints:
-                payload = await self._fetch_json_url(ep_url, headers=OZON_APP_HEADERS)
-                if not payload:
-                    continue
-                if payload.get("_http_status") == 404:
-                    return ProductCardData(in_stock=False)
-                parsed = parse_ozon_composer_payload(
-                    payload,
-                    default_currency=default_curr,
-                    rub_to_byn_rate=rub_rate,
-                )
-                if parsed is not None:
-                    card_data = merge_card_data(card_data, parsed)
-                    if card_data.in_stock is False:
-                        return card_data
-                    if (
-                        card_data.title
-                        and card_data.price_byn is not None
-                        and card_data.image_url
-                        and card_data.avg_month_price_byn is not None
-                    ):
-                        return card_data
+            for req_headers in header_variants:
+                for ep_url in endpoints:
+                    payload = await self._fetch_json_url(ep_url, headers=req_headers)
+                    if not payload:
+                        continue
+                    if payload.get("_http_status") == 404:
+                        return ProductCardData(in_stock=False)
+                    parsed = parse_ozon_composer_payload(
+                        payload,
+                        default_currency=default_curr,
+                        rub_to_byn_rate=rub_rate,
+                    )
+                    if parsed is not None:
+                        card_data = merge_card_data(card_data, parsed)
+                        if card_data.in_stock is False and card_data.price_byn is None:
+                            return card_data
+                        if (
+                            card_data.title
+                            and card_data.price_byn is not None
+                            and card_data.image_url
+                            and card_data.avg_month_price_byn is not None
+                        ):
+                            return card_data
 
-        # 2. Пробуем получить карточку (включая попап «Стало дешевле» и фото) через прогретый браузер Playwright
         if self.browser_resolver.is_available and (
             card_data is None
             or not card_data.title
@@ -3349,13 +4155,12 @@ class ParserApp:
             if fresh_cookies:
                 self._sync_cookies_to_http_clients(fresh_cookies)
             if browser_card is not None:
+                if browser_card.in_stock is False and browser_card.price_byn is None:
+                    return browser_card
                 card_data = merge_card_data(card_data, browser_card)
-                if card_data.in_stock is False:
-                    return card_data
                 if card_data.title and card_data.price_byn is not None and card_data.image_url:
                     return card_data
 
-        # 3. Пробуем прямой HTML карточки на ozon.by через curl_cffi
         if self.curl_session is not None and (
             card_data is None or not card_data.title or card_data.price_byn is None or not card_data.image_url
         ):
@@ -3386,7 +4191,6 @@ class ParserApp:
                                 ):
                                     return card_data
 
-        # 4. Пробуем Telegram GetWebPageRequest для https://ozon.by/product/<sku>/ и превью сообщения
         if self.user_client.is_connected() and "GetWebPageRequest" in globals() and (
             card_data is None or not card_data.title or card_data.price_byn is None
         ):
@@ -4195,13 +4999,19 @@ class ParserApp:
             if self.browser_resolver.is_running
             else ("🟡 готов (по требованию)" if self.browser_resolver.is_available else "🔴 недоступен")
         )
+        ozon_account_str = (
+            f"🟢 привязан ({self.ozon_auth_label})"
+            if self.ozon_auth_active
+            else "⚪️ гостевой режим (без аккаунта)"
+        )
         return (
             "🤖 Панель управления парсером\n\n"
             f"Статус: {status}{mode}\n"
             f"Каналов в папке: {len(self.current_sources)}\n"
             f"Очередь: {self.queue.qsize()}/{self.queue.maxsize}\n"
             f"Аптайм: {hours}ч {minutes}м {seconds}с\n\n"
-            f"🛡 Антибот и карточки:\n"
+            f"🛡 Антибот и аккаунт Ozon:\n"
+            f"• Аккаунт Ozon: {ozon_account_str}\n"
             f"• Браузер (Playwright): {browser_state}\n"
             f"• Cookies в сессии: {self.synced_cookie_count}\n"
             f"• Раскрыто через HTTP/curl: {self.state.http_resolved}\n"
@@ -4223,8 +5033,10 @@ class ParserApp:
             if self.state.is_paused
             else Button.inline("⏸ Пауза", b"pause")
         )
+        ozon_btn_label = "🍪 Аккаунт Ozon (привязан)" if self.ozon_auth_active else "🍪 Привязать аккаунт Ozon"
         return [
             [Button.inline("📊 Обновить статус", b"refresh"), pause_button],
+            [Button.inline(ozon_btn_label, b"ozon_auth_menu")],
             [Button.inline("🔄 Обновить источники", b"reload_sources")],
             [Button.inline("🧹 Очистить дедупликацию", b"clear_db_confirm")],
         ]
@@ -4249,7 +5061,62 @@ class ParserApp:
         async def admin_start(event):
             if event.sender_id != self.settings.admin_id:
                 return
+            self._awaiting_ozon_cookies = False
             await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+
+        @self.bot_client.on(events.NewMessage(chats=self.settings.admin_id))
+        async def admin_cookies_input_handler(event):
+            if event.sender_id != self.settings.admin_id:
+                return
+            raw_text = (event.raw_text or "").strip()
+            if raw_text == "/start":
+                return
+
+            is_cookie_cmd = raw_text.startswith("/ozon_cookies")
+            if not self._awaiting_ozon_cookies and not is_cookie_cmd:
+                return
+
+            payload_text = raw_text[len("/ozon_cookies"):].strip() if is_cookie_cmd else raw_text
+
+            if event.message.file and not payload_text:
+                with suppress(Exception):
+                    file_bytes = await event.message.download_media(bytes)
+                    if file_bytes:
+                        payload_text = file_bytes.decode("utf-8", errors="ignore").strip()
+
+            if not payload_text:
+                self._awaiting_ozon_cookies = True
+                await event.respond(
+                    "🍪 Отправьте cookies от вашего аккаунта Ozon текстом или файлом (.json / .txt).\n\n"
+                    "Поддерживаются форматы:\n"
+                    "1) JSON-экспорт из расширения Cookie-Editor / EditThisCookie\n"
+                    "2) Строка заголовка Cookie из DevTools (key1=val1; key2=val2)\n"
+                    "3) Файл cookies.txt (Netscape)",
+                    buttons=[[Button.inline("↩️ Отмена", b"refresh")]],
+                )
+                return
+
+            parsed_cookies = parse_ozon_cookies_input(payload_text)
+            if not parsed_cookies:
+                await event.respond(
+                    "❌ Не удалось распознать cookies в сообщении. Проверьте формат (JSON или key=value; ...) и попробуйте ещё раз.",
+                    buttons=[[Button.inline("↩️ Назад", b"refresh")]],
+                )
+                return
+
+            self._awaiting_ozon_cookies = False
+            merged = await self.browser_resolver.import_cookies(parsed_cookies)
+            self._sync_cookies_to_http_clients(merged)
+            is_auth, auth_label = extract_ozon_auth_info(merged)
+            status_line = (
+                f"🟢 Авторизационные токены найдены ({auth_label}) — парсер будет получать персональные цены аккаунта!"
+                if is_auth
+                else "⚠️ Cookies сохранены, но токен авторизации (__Secure-access-token / __Secure-refresh-token) не обнаружен. Убедитесь, что вы вошли в аккаунт перед экспортом."
+            )
+            await event.respond(
+                f"✅ Cookies Ozon успешно загружены ({self.synced_cookie_count} ключей)!\n{status_line}",
+                buttons=self.get_admin_keyboard(),
+            )
 
         @self.bot_client.on(events.CallbackQuery(chats=self.settings.admin_id))
         async def admin_callback(event):
@@ -4258,6 +5125,7 @@ class ParserApp:
                 return
             data = event.data
             if data == b"refresh":
+                self._awaiting_ozon_cookies = False
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Данные обновлены")
             elif data == b"pause":
@@ -4268,6 +5136,42 @@ class ParserApp:
                 self.state.is_paused = False
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Парсинг возобновлён")
+            elif data == b"ozon_auth_menu":
+                self._awaiting_ozon_cookies = True
+                cur_status = (
+                    f"🟢 Привязан ({self.ozon_auth_label})"
+                    if self.ozon_auth_active
+                    else "⚪️ Не привязан (гостевой режим)"
+                )
+                await event.edit(
+                    f"🍪 Привязка аккаунта Ozon для персональных скидок\n"
+                    f"Текущий статус: {cur_status}\n\n"
+                    f"Как привязать отдельный аккаунт Ozon:\n"
+                    f"1. Откройте ozon.by в браузере и войдите в нужный аккаунт.\n"
+                    f"2. Экспортируйте cookies через расширение Cookie-Editor (Export -> JSON) "
+                    f"или скопируйте заголовок Cookie из DevTools (F12 -> Network).\n"
+                    f"3. Просто отправьте скопированный текст или .json/.txt файл следующим сообщением сюда в бот!\n\n"
+                    f"Альтернативно можно прописать OZON_COOKIES в .env или запустить на ПК: python parser.py --login-ozon",
+                    buttons=[
+                        [Button.inline("🗑 Отвязать / очистить cookies", b"ozon_auth_clear")],
+                        [Button.inline("↩️ Назад", b"refresh")],
+                    ],
+                )
+                await event.answer("Ожидание cookies Ozon")
+            elif data == b"ozon_auth_clear":
+                self._awaiting_ozon_cookies = False
+                await self.browser_resolver.clear_cookies()
+                self.ozon_auth_active = False
+                self.ozon_auth_label = ""
+                self.synced_cookie_count = 0
+                if self.curl_session is not None:
+                    with suppress(Exception):
+                        self.curl_session.cookies.clear()
+                if self.http_session is not None:
+                    with suppress(Exception):
+                        self.http_session.cookie_jar.clear()
+                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.answer("Cookies аккаунта Ozon удалены")
             elif data == b"reload_sources":
                 channels = await self.update_sources()
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
@@ -4328,12 +5232,12 @@ class ParserApp:
         await self.browser_resolver.start_idle_monitor()
         if self.browser_resolver.is_available:
             log(
-                f"Активирован браузерный резолвер Ozon (Playwright Chromium, "
+                f"Активирован браузерный резолвер Ozon/WB (Playwright Chromium, "
                 f"витрины: {', '.join(self.settings.ozon_preferred_storefronts)})"
             )
         else:
             log(
-                "Playwright недоступен; для гарантированного обхода JS-антибота Ozon "
+                "Playwright недоступен; для гарантированного обхода JS-антибота "
                 "установите: pip install playwright && playwright install chromium",
                 logging.WARNING,
             )
@@ -4400,6 +5304,17 @@ async def main() -> None:
         settings = Settings.from_env()
     except ConfigError as exc:
         raise SystemExit(f"Ошибка конфигурации: {exc}") from exc
+
+    if "--login-ozon" in sys.argv:
+        resolver = OzonBrowserResolver(settings)
+        cookies = await resolver.interactive_login("https://ozon.by/")
+        is_auth, label = extract_ozon_auth_info(cookies)
+        log(
+            f"Сессия Ozon сохранена в {settings.cookies_cache_path} и {settings.browser_profile_dir} "
+            f"(авторизация: {'да, ' + label if is_auth else 'гостевая'})"
+        )
+        return
+
     app = ParserApp(settings)
     await app.run()
 
