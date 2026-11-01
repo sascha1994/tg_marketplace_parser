@@ -1,4 +1,5 @@
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from dataclasses import dataclass
@@ -73,6 +74,8 @@ class Settings:
     prefer_card_image: bool = True
     include_source_notes: bool = False
     data_dir: str = "data"
+    timezone: str = "Europe/Minsk"
+    test_channel: str = ""
 
     @property
     def user_session_path(self) -> str:
@@ -103,6 +106,7 @@ class Settings:
         api_hash = os.getenv("TG_API_HASH", "").strip()
         bot_token = os.getenv("BOT_TOKEN", "").strip()
         target_channel = os.getenv("TG_TARGET_CHANNEL", "").strip()
+        test_channel = os.getenv("TG_TEST_CHANNEL", "").strip()
         if not api_hash:
             raise ConfigError("В .env не задан TG_API_HASH")
         if not bot_token:
@@ -124,6 +128,12 @@ class Settings:
         canonical_host = os.getenv("OZON_CANONICAL_HOST", "ozon.by").strip().lower()
         if canonical_host not in OZON_DOMAINS:
             canonical_host = "ozon.by"
+
+        timezone = os.getenv("TIMEZONE", "Europe/Minsk").strip() or "Europe/Minsk"
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigError(f"TIMEZONE содержит неизвестную временную зону: {timezone!r}") from exc
 
         return cls(
             api_id=env_int("TG_API_ID", minimum=1),
@@ -154,4 +164,6 @@ class Settings:
             require_price=env_bool("REQUIRE_PRICE", default=True),
             prefer_card_image=env_bool("PREFER_CARD_IMAGE", default=True),
             include_source_notes=env_bool("INCLUDE_SOURCE_NOTES", default=False),
+            timezone=timezone,
+            test_channel=test_channel,
         )

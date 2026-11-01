@@ -29,12 +29,15 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self.browser_resolver = OzonBrowserResolver(settings)
         self.target_entity = None
         self.target_peer_id: int | None = None
+        self.channel_entities: dict[str, object] = {}
         self.current_sources: set[int] = set()
         self.queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=500)
         self.workers: list[asyncio.Task] = []
+        self.publication_scheduler_task: asyncio.Task | None = None
         self.retry_tasks: set[asyncio.Task] = set()
         self.resolve_semaphore = asyncio.Semaphore(8)
         self.publish_lock = asyncio.Lock()
+        self.publication_gate_lock = asyncio.Lock()
         self.album_messages: dict[int, list] = {}
         self.album_tasks: dict[int, asyncio.Task] = {}
         self.album_lock = asyncio.Lock()
@@ -42,4 +45,6 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self._rub_to_byn_rate: float = settings.rub_to_byn_fallback_rate
         self._rate_updated_at: float = 0.0
         self._rate_lock = asyncio.Lock()
+        self.awaiting_schedule_input = False
+        self._last_ozon_stock_check_at = 0.0
         self._register_admin_handlers()

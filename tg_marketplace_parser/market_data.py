@@ -713,6 +713,40 @@ class MarketDataMixin:
 
         return card_data
 
+    async def fetch_wb_cards_batch(
+        self,
+        skus: Iterable[str],
+    ) -> dict[str, ProductCardData | None]:
+        """Checks a bounded set of WB SKUs in one detail request."""
+        requested = list(dict.fromkeys(str(sku).strip() for sku in skus if str(sku).strip()))[:20]
+        if not requested:
+            return {}
+        encoded_skus = ",".join(requested)
+        url = (
+            "https://card.wb.ru/cards/v4/detail"
+            f"?appType=1&curr=byn&dest={self.settings.wb_dest_byn}"
+            f"&spp={self.settings.wb_spp}&nm={encoded_skus}"
+        )
+        payload = await self._fetch_json_url(
+            url,
+            headers={
+                "Origin": "https://www.wildberries.by",
+                "Referer": "https://www.wildberries.by/",
+            },
+            timeout_override=8.0,
+        )
+        if not payload or payload.get("_http_status") in {403, 404, 429}:
+            return {sku: None for sku in requested}
+        return {
+            sku: parse_wb_detail_payload(
+                payload,
+                sku=sku,
+                currency="BYN",
+                rub_to_byn_rate=self._rub_to_byn_rate,
+            )
+            for sku in requested
+        }
+
     async def fetch_ozon_card_data(
         self,
         sku: str,
@@ -905,6 +939,18 @@ class MarketDataMixin:
                 log(f"Товар {product.platform} (арт. {product.sku}) отсутствует в наличии — публикация отменена")
                 return None
 
+        if (
+            card is not None
+            and product.platform == "Wildberries"
+            and card.total_quantity is not None
+            and card.total_quantity < 3
+        ):
+            log(
+                f"Товар Wildberries (арт. {product.sku}) отклонён: "
+                f"остаток {card.total_quantity}, требуется не менее 3"
+            )
+            return None
+
         if self.settings.require_price and (card is None or card.price_byn is None or card.price_byn <= 0):
             log(
                 f"Для товара {product.platform} (арт. {product.sku}) не найдена актуальная цена / нет в наличии — "
@@ -924,6 +970,7 @@ class MarketDataMixin:
             old_price_byn=card.old_price_byn,
             image_url=card.image_url or product.image_url,
             in_stock=card.in_stock is not False,
+            total_quantity=card.total_quantity,
             rating=card.rating,
             reviews_count=card.reviews_count,
         )

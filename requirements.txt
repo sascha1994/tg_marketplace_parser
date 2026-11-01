@@ -10,3 +10,5 @@ playwright>=1.47.0
 Pillow>=10.4.0
 # Загрузка конфигурации из .env
 python-dotenv>=1.0.1
+# IANA time-zone database for Windows deployments
+tzdata>=2024.1

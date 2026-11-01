@@ -79,12 +79,17 @@ class RuntimeMixin:
 
             self.target_entity = await self.user_client.get_entity(target_reference)
             self.target_peer_id = get_peer_id(self.target_entity)
+            self.channel_entities["main"] = self.target_entity
 
             await self.update_sources()
             self.workers = [
                 asyncio.create_task(self.process_worker(number), name=f"parser-worker-{number}")
                 for number in range(1, self.settings.worker_count + 1)
             ]
+            self.publication_scheduler_task = asyncio.create_task(
+                self.scheduled_publication_worker(),
+                name="publication-scheduler",
+            )
             await self.bot_client.send_message(
                 self.settings.admin_id,
                 "🟢 Парсер запущен и слушает источники.",
@@ -95,7 +100,12 @@ class RuntimeMixin:
                 self.bot_client.run_until_disconnected(),
             )
         finally:
-            pending = [*self.workers, *self.album_tasks.values(), *self.retry_tasks]
+            pending = [
+                *self.workers,
+                *self.album_tasks.values(),
+                *self.retry_tasks,
+                *([self.publication_scheduler_task] if self.publication_scheduler_task else []),
+            ]
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)

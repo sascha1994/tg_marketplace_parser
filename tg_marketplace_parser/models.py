@@ -11,6 +11,7 @@ class ProductCardData:
     old_price_byn: float | None = None
     image_url: str = ""
     in_stock: bool | None = None
+    total_quantity: int | None = None
     rating: float | None = None
     reviews_count: int | None = None
     raw_currency: str = "BYN"
@@ -30,6 +31,7 @@ class ProductInfo:
     old_price_byn: float | None = None
     image_url: str = ""
     in_stock: bool = True
+    total_quantity: int | None = None
     rating: float | None = None
     reviews_count: int | None = None
 
@@ -72,11 +74,24 @@ class ProductInfo:
             return format_byn_price(self.old_price_byn)
         return None
 
+    @property
+    def discount_percent(self) -> float | None:
+        if (
+            self.avg_month_price_byn is None
+            or self.avg_month_price_byn <= 0
+            or self.price_byn is None
+            or self.price_byn <= 0
+        ):
+            return None
+        return (self.avg_month_price_byn - self.price_byn) * 100 / self.avg_month_price_byn
+
 @dataclass
 class Job:
     messages: list
     source_chat_id: int
     attempts: int = 0
+    target_channel: str | None = None
+
 
 @dataclass
 class ParserState:

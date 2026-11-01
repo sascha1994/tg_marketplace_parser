@@ -281,7 +281,11 @@ def parse_wb_detail_payload(
         if fb_val is not None:
             reviews_count = int(fb_val)
 
-    total_quantity = item.get("totalQuantity")
+    raw_total_quantity = item.get("totalQuantity")
+    total_quantity: int | None = None
+    if raw_total_quantity is not None and not isinstance(raw_total_quantity, bool):
+        with suppress(TypeError, ValueError):
+            total_quantity = int(raw_total_quantity)
     sizes = item.get("sizes") if isinstance(item.get("sizes"), list) else []
 
     total_stocks_qty = 0
@@ -394,6 +398,10 @@ def parse_wb_detail_payload(
     price_byn = convert_to_byn(raw_price, currency, rub_to_byn_rate) if in_stock is not False else None
     old_price_byn = convert_to_byn(raw_old_price, currency, rub_to_byn_rate) if in_stock is not False else None
 
+    reported_quantity = total_quantity
+    if reported_quantity is None and has_nonempty_stocks_entries:
+        reported_quantity = total_stocks_qty
+
     return ProductCardData(
         title=clean_product_title(raw_name, raw_brand),
         brand=raw_brand,
@@ -401,6 +409,7 @@ def parse_wb_detail_payload(
         old_price_byn=old_price_byn,
         image_url=image_url,
         in_stock=in_stock,
+        total_quantity=reported_quantity,
         rating=rating,
         reviews_count=reviews_count,
         raw_currency=currency.upper(),
@@ -986,6 +995,11 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
             if WB_BASKET_VOL_CACHE.get(sec_vol) == sec_host:
                 image_url = secondary.image_url
 
+    quantities = [
+        quantity
+        for quantity in (primary.total_quantity, secondary.total_quantity)
+        if quantity is not None
+    ]
     return ProductCardData(
         title=title,
         brand=brand,
@@ -994,6 +1008,7 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
         old_price_byn=old_price_byn,
         image_url=image_url,
         in_stock=in_stock,
+        total_quantity=max(quantities) if quantities else None,
         rating=primary.rating if primary.rating is not None else secondary.rating,
         reviews_count=primary.reviews_count if primary.reviews_count is not None else secondary.reviews_count,
         raw_currency=primary.raw_currency or secondary.raw_currency,

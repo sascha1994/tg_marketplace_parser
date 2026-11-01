@@ -1,5 +1,7 @@
+import json
 import sqlite3
 import time
+from dataclasses import asdict
 from contextlib import suppress
 from typing import Iterable
 
@@ -47,6 +49,133 @@ class DuplicateDB:
             "CREATE INDEX IF NOT EXISTS idx_seen_items_status_time "
             "ON seen_items(status, published_at, created_at)"
         )
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scheduled_publications (
+                sku_key TEXT PRIMARY KEY,
+                product_json TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                target_channel TEXT NOT NULL DEFAULT 'main',
+                due_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_publications_due
+                ON scheduled_publications(due_at);
+            CREATE TABLE IF NOT EXISTS published_posts (
+                post_id TEXT PRIMARY KEY,
+                sku_key TEXT NOT NULL,
+                product_json TEXT NOT NULL,
+                publication_text TEXT NOT NULL,
+                message_ids TEXT NOT NULL,
+                published_at INTEGER NOT NULL,
+                next_check_at INTEGER NOT NULL,
+                discount_percent REAL,
+                target_channel TEXT NOT NULL DEFAULT 'main',
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE INDEX IF NOT EXISTS idx_published_posts_due
+                ON published_posts(status, next_check_at);
+            CREATE INDEX IF NOT EXISTS idx_published_posts_sku
+                ON published_posts(sku_key);
+            """
+        )
+        self._migrate_publication_tables()
+
+    def _migrate_publication_tables(self) -> None:
+        scheduled_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(scheduled_publications)")
+        }
+        if "target_channel" not in scheduled_columns:
+            self._conn.execute(
+                "ALTER TABLE scheduled_publications ADD COLUMN target_channel "
+                "TEXT NOT NULL DEFAULT 'main'"
+            )
+
+        published_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(published_posts)")
+        }
+        if "post_id" not in published_columns:
+            self._conn.execute("ALTER TABLE published_posts RENAME TO published_posts_legacy")
+            self._conn.executescript(
+                """
+                CREATE TABLE published_posts (
+                    post_id TEXT PRIMARY KEY,
+                    sku_key TEXT NOT NULL,
+                    product_json TEXT NOT NULL,
+                    publication_text TEXT NOT NULL,
+                    message_ids TEXT NOT NULL,
+                    published_at INTEGER NOT NULL,
+                    next_check_at INTEGER NOT NULL,
+                    discount_percent REAL,
+                    target_channel TEXT NOT NULL DEFAULT 'main',
+                    status TEXT NOT NULL DEFAULT 'active'
+                );
+                CREATE INDEX IF NOT EXISTS idx_published_posts_due
+                    ON published_posts(status, next_check_at);
+                CREATE INDEX IF NOT EXISTS idx_published_posts_sku
+                    ON published_posts(sku_key);
+                """
+            )
+            legacy_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(published_posts_legacy)")
+            }
+            if {
+                "sku_key",
+                "product_json",
+                "publication_text",
+                "message_ids",
+                "published_at",
+                "next_check_at",
+                "discount_percent",
+            }.issubset(legacy_columns):
+                rows = self._conn.execute("SELECT * FROM published_posts_legacy").fetchall()
+                names = [row[1] for row in self._conn.execute("PRAGMA table_info(published_posts_legacy)")]
+                for values in rows:
+                    old = dict(zip(names, values))
+                    message_ids = old.get("message_ids") or "[]"
+                    try:
+                        parsed_ids = json.loads(message_ids)
+                    except (TypeError, ValueError):
+                        parsed_ids = []
+                    post_id = f"main:{parsed_ids[0]}" if parsed_ids else f"main:{old['sku_key']}"
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO published_posts(
+                            post_id, sku_key, product_json, publication_text, message_ids,
+                            published_at, next_check_at, discount_percent, target_channel, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'main', ?)
+                        """,
+                        (
+                            post_id,
+                            old["sku_key"],
+                            old["product_json"],
+                            old["publication_text"],
+                            message_ids,
+                            old["published_at"],
+                            old["next_check_at"],
+                            old["discount_percent"],
+                            old.get("status", "active"),
+                        ),
+                    )
+            self._conn.execute("DROP TABLE published_posts_legacy")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_published_posts_due "
+                "ON published_posts(status, next_check_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_published_posts_sku "
+                "ON published_posts(sku_key)"
+            )
+        elif "target_channel" not in published_columns:
+            self._conn.execute(
+                "ALTER TABLE published_posts ADD COLUMN target_channel "
+                "TEXT NOT NULL DEFAULT 'main'"
+            )
 
     def reserve_fresh(
         self,
@@ -69,7 +198,8 @@ class DuplicateDB:
                 (published_cutoff,),
             )
             self._conn.execute(
-                "DELETE FROM seen_items WHERE status = 'pending' AND created_at < ?",
+                "DELETE FROM seen_items WHERE status = 'pending' AND created_at < ? "
+                "AND sku_key NOT IN (SELECT sku_key FROM scheduled_publications)",
                 (pending_cutoff,),
             )
             placeholders = ",".join("?" for _ in products_by_key)
@@ -118,6 +248,164 @@ class DuplicateDB:
             (now, *keys),
         )
 
+    def get_setting(self, key: str, default: str) -> str:
+        row = self._conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def save_scheduled_publication(
+        self,
+        product: ProductInfo,
+        source_text: str,
+        source_chat_id: int,
+        due_at: int,
+        target_channel: str = "main",
+        attempts: int = 0,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO scheduled_publications(
+                sku_key, product_json, source_text, source_chat_id, target_channel, due_at, attempts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sku_key) DO UPDATE SET
+                product_json = excluded.product_json,
+                source_text = excluded.source_text,
+                source_chat_id = excluded.source_chat_id,
+                target_channel = excluded.target_channel,
+                due_at = excluded.due_at,
+                attempts = excluded.attempts
+            """,
+            (
+                product.sku_key,
+                json.dumps(asdict(product), ensure_ascii=False),
+                source_text,
+                source_chat_id,
+                target_channel,
+                due_at,
+                attempts,
+            ),
+        )
+
+    def get_due_scheduled_publications(self, now: int, limit: int = 1) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT sku_key, product_json, source_text, source_chat_id, target_channel, due_at, attempts "
+            "FROM scheduled_publications WHERE due_at <= ? ORDER BY due_at LIMIT ?",
+            (now, limit),
+        ).fetchall()
+        return [
+            {
+                "sku_key": row[0],
+                "product_json": row[1],
+                "source_text": row[2],
+                "source_chat_id": row[3],
+                "target_channel": row[4],
+                "due_at": row[5],
+                "attempts": row[6],
+            }
+            for row in rows
+        ]
+
+    def reschedule_publication(self, sku_key: str, due_at: int, *, increment_attempts: bool = True) -> None:
+        self._conn.execute(
+            "UPDATE scheduled_publications SET due_at = ?, "
+            "attempts = attempts + ? WHERE sku_key = ?",
+            (due_at, int(increment_attempts), sku_key),
+        )
+
+    def delete_scheduled_publication(self, sku_key: str) -> None:
+        self._conn.execute("DELETE FROM scheduled_publications WHERE sku_key = ?", (sku_key,))
+
+    def save_published_post(
+        self,
+        product: ProductInfo,
+        publication_text: str,
+        message_ids: Iterable[int],
+        discount_percent: float | None,
+        published_at: int,
+        target_channel: str = "main",
+    ) -> None:
+        message_id_list = list(message_ids)
+        if not message_id_list:
+            raise ValueError("published post must contain at least one Telegram message ID")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO published_posts(
+                    post_id, sku_key, product_json, publication_text, message_ids, published_at,
+                    next_check_at, discount_percent, target_channel, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                """,
+                (
+                    f"{target_channel}:{message_id_list[0]}",
+                    product.sku_key,
+                    json.dumps(asdict(product), ensure_ascii=False),
+                    publication_text,
+                    json.dumps(message_id_list),
+                    published_at,
+                    published_at + 15 * 60,
+                    discount_percent,
+                    target_channel,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE seen_items SET status = 'published', published_at = ? "
+                "WHERE status = 'pending' AND sku_key = ?",
+                (published_at, product.sku_key),
+            )
+            self._conn.execute(
+                "DELETE FROM scheduled_publications WHERE sku_key = ?",
+                (product.sku_key,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def get_due_published_posts(self, now: int, limit: int = 1) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT post_id, sku_key, product_json, publication_text, message_ids, published_at, "
+            "next_check_at, discount_percent, target_channel FROM published_posts "
+            "WHERE status = 'active' AND next_check_at <= ? "
+            "ORDER BY next_check_at LIMIT ?",
+            (now, limit),
+        ).fetchall()
+        return [
+            {
+                "post_id": row[0],
+                "sku_key": row[1],
+                "product_json": row[2],
+                "publication_text": row[3],
+                "message_ids": row[4],
+                "published_at": row[5],
+                "next_check_at": row[6],
+                "discount_percent": row[7],
+                "target_channel": row[8],
+            }
+            for row in rows
+        ]
+
+    def set_published_post_status(self, post_id: str, status: str) -> None:
+        self._conn.execute(
+            "UPDATE published_posts SET status = ? WHERE post_id = ?",
+            (status, post_id),
+        )
+
+    def defer_published_post_check(self, post_id: str, next_check_at: int) -> None:
+        self._conn.execute(
+            "UPDATE published_posts SET next_check_at = ? WHERE post_id = ? AND status = 'active'",
+            (next_check_at, post_id),
+        )
+
     def release_reservations(self, sku_keys: Iterable[str]) -> None:
         keys = tuple(set(sku_keys))
         if not keys:
@@ -127,9 +415,16 @@ class DuplicateDB:
             f"DELETE FROM seen_items WHERE status = 'pending' AND sku_key IN ({placeholders})",
             keys,
         )
+        placeholders = ",".join("?" for _ in keys)
+        self._conn.execute(
+            f"DELETE FROM scheduled_publications WHERE sku_key IN ({placeholders})",
+            keys,
+        )
 
     def clear_published(self) -> None:
         self._conn.execute("DELETE FROM seen_items")
+        self._conn.execute("DELETE FROM scheduled_publications")
+        self._conn.execute("DELETE FROM published_posts")
 
     def count_by_status(self) -> tuple[int, int]:
         rows = self._conn.execute(
@@ -141,4 +436,3 @@ class DuplicateDB:
     def close(self) -> None:
         with suppress(Exception):
             self._conn.close()
-
