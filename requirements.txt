@@ -1,7 +1,12 @@
-aiohttp>=3.9.0,<4.0.0
-python-dotenv>=1.0.0,<2.0.0
+# Telegram MTProto-клиент
 Telethon>=1.36.0,<2.0.0
-Pillow>=10.0.0,<12.0.0
-curl_cffi>=0.7.0,<1.0.0
-playwright>=1.45.0,<2.0.0
-patchright>=1.45.0,<2.0.0
+# Асинхронные HTTP-клиенты и обход TLS-фингерпринтинга (Chrome impersonation)
+aiohttp>=3.9.5,<4.0.0
+Brotli>=1.1.0
+curl_cffi>=0.7.1
+# Браузерный резолвер для обхода JS-антибота Ozon и Wildberries
+playwright>=1.47.0
+# Обработка и конвертация изображений товаров (WEBP/PNG -> JPEG)
+Pillow>=10.4.0
+# Загрузка конфигурации из .env
+python-dotenv>=1.0.1

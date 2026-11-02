@@ -393,7 +393,7 @@ TITLE_SEO_SUFFIX_PATTERNS = (
 
 PRICE_VALUE_RE = re.compile(
     r"(?<![A-Za-zА-Яа-яЁё0-9_])"
-    r"(\d[\d\s\u00a0\u202f\u2009]*(?:[.,]\d{1,2})?)\s*"
+    r"(\d[\d\s\u00a0\u202f\u2009\u2007]*(?:[.,]\d{1,2})?)\s*"
     r"(byn|бел\.?\s*руб\.?|бр\.?|р\.|руб\.?|₽|rub|rur)?"
     r"(?![A-Za-zА-Яа-яЁё0-9_])",
     re.IGNORECASE,
@@ -402,7 +402,7 @@ PRICE_VALUE_RE = re.compile(
 # Строгое регулярное выражение цены с обязательным указанием валюты (исключает захват 400/500 из tsBody400Small / HEADLINE_500)
 STRICT_PRICE_WITH_CURRENCY_RE = re.compile(
     r"(?<![A-Za-zА-Яа-яЁё0-9_])"
-    r"(\d[\d\s\u00a0\u202f\u2009]*(?:[.,]\d{1,2})?)\s*"
+    r"(\d[\d\s\u00a0\u202f\u2009\u2007]*(?:[.,]\d{1,2})?)\s*"
     r"(byn|бел\.?\s*руб\.?|бр\.?|р\.|руб\.?|₽|rub|rur)"
     r"(?![A-Za-zА-Яа-яЁё0-9_])",
     re.IGNORECASE,
@@ -410,9 +410,15 @@ STRICT_PRICE_WITH_CURRENCY_RE = re.compile(
 
 # Поиск подписи средней цены за месяц в Ozon («Средняя за сентябрь», исключая дисклеймер «со средней за прошлый месяц»)
 AVG_MONTH_LABEL_RE = re.compile(
-    r"(?<!со\s)средняя\s+(?:цена\s+)?за\s+"
-    r"(?:прошлый\s+месяц|месяц|январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|"
+    r"(?<!со\s)средн(?:яя|ей)\s+(?:цена\s+)?за\s+"
+    r"(?:прошлый\s+месяц|последний\s+месяц|\d+\s*дн(?:ей|я)|месяц|"
+    r"январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|"
     r"июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])",
+    re.IGNORECASE,
+)
+
+OZON_CHEAPER_BLOCK_RE = re.compile(
+    r"(?:стало\s+дешевле|цена\s+сейчас|(?<!со\s)средн(?:яя|ей)\s+(?:цена\s+)?за\s+)",
     re.IGNORECASE,
 )
 
@@ -1075,7 +1081,11 @@ def parse_price_value_and_currency(
         val = float(raw_value)
         return (val if val > 0 else None), default_currency.upper()
 
-    text = clean_html_tags(str(raw_value))
+    raw_str = str(raw_value)
+    if "\\u" in raw_str:
+        for esc in ("\\u00a0", "\\u202f", "\\u2009", "\\u2007", "\\u00A0", "\\u202F", "\\u2009"):
+            raw_str = raw_str.replace(esc, " ")
+    text = clean_html_tags(raw_str)
     if not text:
         return None, default_currency.upper()
 
@@ -1084,7 +1094,7 @@ def parse_price_value_and_currency(
     if not match:
         return None, default_currency.upper()
 
-    num_str = re.sub(r"[\s\u00a0\u202f\u2009]+", "", match.group(1)).replace(",", ".")
+    num_str = re.sub(r"[\s\u00a0\u202f\u2009\u2007]+", "", match.group(1)).replace(",", ".")
     try:
         val = float(num_str)
     except ValueError:
@@ -1126,56 +1136,167 @@ def convert_to_byn(
     return round(amount, 2)
 
 
-def _is_plausible_avg_price(avg_byn: float | None, actual_price_byn: float | None) -> bool:
+def _is_plausible_avg_price(
+    avg_byn: float | None,
+    actual_price_byn: float | None,
+    old_price_byn: float | None = None,
+) -> bool:
     """Проверяет, что найденная средняя цена реалистична относительно актуальной цены товара."""
     if avg_byn is None or avg_byn <= 0:
         return False
-    if actual_price_byn is None or actual_price_byn <= 0:
-        return True
-    # Средняя цена в блоке «Стало дешевле» всегда выше актуальной и не может отличаться в десятки раз (как ложные 400 BYN при цене 3.52 BYN)
-    return actual_price_byn * 1.005 <= avg_byn <= max(actual_price_byn * 6.0, actual_price_byn + 250.0)
+    if actual_price_byn is not None and actual_price_byn > 0:
+        if avg_byn <= actual_price_byn * 1.002:
+            return False
+        if avg_byn > max(actual_price_byn * 6.0, actual_price_byn + 250.0):
+            return False
+    if old_price_byn is not None and old_price_byn > 0:
+        if abs(avg_byn - old_price_byn) < 0.01:
+            return False
+    return True
+
+
+def _extract_all_strict_prices_byn(
+    text: str,
+    *,
+    default_currency: str = "BYN",
+    rub_to_byn_rate: float = 0.0345,
+) -> list[float]:
+    """Извлекает все цены с явно указанной валютой из текста и конвертирует их в BYN."""
+    results: list[float] = []
+    for m in STRICT_PRICE_WITH_CURRENCY_RE.finditer(text):
+        raw_p = f"{m.group(1)} {m.group(2)}"
+        val, curr = parse_price_value_and_currency(raw_p, default_currency=default_currency, require_currency=True)
+        byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
+        if byn_val is not None and byn_val > 0:
+            results.append(byn_val)
+    return results
+
+
+def _find_math_trio_avg_price(
+    prices_byn: list[float],
+    actual_price_byn: float | None = None,
+    old_price_byn: float | None = None,
+) -> float | None:
+    """Находит среднюю цену в блоке «Стало дешевле» по точной формуле Ozon:
+    Цена сейчас (actual) + Скидка на бейдже (drop) == Средняя за месяц (avg).
+    Например: 29,15 + 8,28 == 37,43 BYN или 3,52 + 0,24 == 3,76 BYN.
+    """
+    if len(prices_byn) < 2:
+        return None
+
+    # 1. Если известна актуальная цена (например, 29.15 BYN), ищем пару (drop, avg), где actual + drop == avg
+    if actual_price_byn is not None and actual_price_byn > 0:
+        for i, drop_val in enumerate(prices_byn):
+            if drop_val <= 0:
+                continue
+            expected_avg = round(actual_price_byn + drop_val, 2)
+            for j, cand_avg in enumerate(prices_byn):
+                if i == j:
+                    continue
+                if abs(cand_avg - expected_avg) <= 0.05 and _is_plausible_avg_price(
+                    cand_avg, actual_price_byn, old_price_byn
+                ):
+                    return cand_avg
+
+    # 2. Если в списке 3 и более цен (actual, drop, avg), проверяем тройку p_now + p_drop == p_avg
+    if len(prices_byn) >= 3:
+        for i in range(len(prices_byn)):
+            p_now = prices_byn[i]
+            if actual_price_byn is not None and abs(p_now - actual_price_byn) > 0.05:
+                continue
+            for j in range(len(prices_byn)):
+                if j == i:
+                    continue
+                p_drop = prices_byn[j]
+                if p_drop <= 0:
+                    continue
+                for k in range(len(prices_byn)):
+                    if k in (i, j):
+                        continue
+                    p_avg = prices_byn[k]
+                    if p_avg > p_now * 1.002 and abs((p_now + p_drop) - p_avg) <= 0.05:
+                        if _is_plausible_avg_price(p_avg, actual_price_byn or p_now, old_price_byn):
+                            return p_avg
+
+    return None
 
 
 def extract_avg_month_price_from_text(
     text: str,
     *,
     actual_price_byn: float | None = None,
+    old_price_byn: float | None = None,
     default_currency: str = "BYN",
     rub_to_byn_rate: float = 0.0345,
 ) -> float | None:
-    """Ищет среднюю цену за месяц в блоке «Стало дешевле» (например: «3,76 BYN Средняя за сентябрь»)."""
+    """Ищет среднюю цену за месяц в блоке «Стало дешевле» (например: «37,43 BYN Средняя за сентябрь»)."""
     if not text:
         return None
 
-    clean_text = clean_html_tags(text)
+    raw_str = text
+    if "\\u" in raw_str:
+        for esc in ("\\u00a0", "\\u202f", "\\u2009", "\\u2007", "\\u00A0", "\\u202F"):
+            raw_str = raw_str.replace(esc, " ")
+    if "<script" in raw_str.lower() or "<style" in raw_str.lower():
+        raw_str = re.sub(r"<script[^>]*>.*?</script>", " ", raw_str, flags=re.IGNORECASE | re.DOTALL)
+        raw_str = re.sub(r"<style[^>]*>.*?</style>", " ", raw_str, flags=re.IGNORECASE | re.DOTALL)
 
-    # 1. Ищем подпись «Средняя за <месяц>» и берём ближайшую цену С ВАЛЮТОЙ непосредственно перед ней (или сразу после неё)
+    clean_text = clean_html_tags(raw_str)
+    if not clean_text:
+        return None
+
+    # 1. Ищем подпись «Средняя за <месяц>» и проверяем как математическую тройку, так и ближайшую цену с валютой
     for label_match in AVG_MONTH_LABEL_RE.finditer(clean_text):
         label_start, label_end = label_match.span()
+        context_window = clean_text[max(0, label_start - 650):min(len(clean_text), label_end + 350)]
+        trio_avg = _find_math_trio_avg_price(
+            _extract_all_strict_prices_byn(
+                context_window,
+                default_currency=default_currency,
+                rub_to_byn_rate=rub_to_byn_rate,
+            ),
+            actual_price_byn=actual_price_byn,
+            old_price_byn=old_price_byn,
+        )
+        if trio_avg is not None:
+            return trio_avg
 
-        # Проверяем окно до 220 символов ПЕРЕД подписью «Средняя за <месяц>»
-        # (в модальном окне Ozon цена «3,76 BYN» всегда идёт прямо перед «Средняя за сентябрь»,
-        # даже если в JSON между ними стоит "textStyle":"tsHeadline500Medium")
-        prefix_window = clean_text[max(0, label_start - 220):label_start]
+        # Проверяем окно до 650 символов ПЕРЕД подписью «Средняя за <месяц>» (от ближайшей цены к дальней)
+        prefix_window = clean_text[max(0, label_start - 650):label_start]
         prefix_matches = list(STRICT_PRICE_WITH_CURRENCY_RE.finditer(prefix_window))
         for m_price in reversed(prefix_matches):
             raw_p = f"{m_price.group(1)} {m_price.group(2)}"
             val, curr = parse_price_value_and_currency(raw_p, default_currency=default_currency, require_currency=True)
             byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
-            if _is_plausible_avg_price(byn_val, actual_price_byn):
+            if _is_plausible_avg_price(byn_val, actual_price_byn, old_price_byn):
                 return byn_val
 
-        # Проверяем окно до 80 символов ПОСЛЕ подписи (вариант «Средняя за сентябрь: 3,76 BYN») — строго с валютой!
-        suffix_window = clean_text[label_end:label_end + 80]
-        m_after = STRICT_PRICE_WITH_CURRENCY_RE.search(suffix_window)
-        if m_after:
+        # Проверяем окно до 350 символов ПОСЛЕ подписи («Средняя за сентябрь: 37,43 BYN»)
+        suffix_window = clean_text[label_end:label_end + 350]
+        for m_after in STRICT_PRICE_WITH_CURRENCY_RE.finditer(suffix_window):
             raw_p = f"{m_after.group(1)} {m_after.group(2)}"
             val, curr = parse_price_value_and_currency(raw_p, default_currency=default_currency, require_currency=True)
             byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
-            if _is_plausible_avg_price(byn_val, actual_price_byn):
+            if _is_plausible_avg_price(byn_val, actual_price_byn, old_price_byn):
                 return byn_val
 
-    # 2. Если есть актуальная цена и зелёный бейдж снижения «↓ 0,24 BYN»
+    # 2. Проверяем математическую тройку (Цена сейчас + Скидка = Средняя) рядом с «Стало дешевле» / «Цена сейчас»
+    for block_match in OZON_CHEAPER_BLOCK_RE.finditer(clean_text):
+        b_start, b_end = block_match.span()
+        window = clean_text[max(0, b_start - 400):min(len(clean_text), b_end + 700)]
+        trio_avg = _find_math_trio_avg_price(
+            _extract_all_strict_prices_byn(
+                window,
+                default_currency=default_currency,
+                rub_to_byn_rate=rub_to_byn_rate,
+            ),
+            actual_price_byn=actual_price_byn,
+            old_price_byn=old_price_byn,
+        )
+        if trio_avg is not None:
+            return trio_avg
+
+    # 3. Если есть актуальная цена и зелёный бейдж снижения со стрелкой «↓ 8,28 BYN»
     if actual_price_byn is not None and actual_price_byn > 0:
         m_drop = PRICE_DROP_BADGE_RE.search(clean_text)
         if m_drop:
@@ -1188,86 +1309,249 @@ def extract_avg_month_price_from_text(
             drop_byn = convert_to_byn(drop_val, drop_curr, rub_to_byn_rate)
             if drop_byn is not None and drop_byn > 0:
                 candidate_avg = round(actual_price_byn + drop_byn, 2)
-                if _is_plausible_avg_price(candidate_avg, actual_price_byn):
+                if _is_plausible_avg_price(candidate_avg, actual_price_byn, old_price_byn):
                     return candidate_avg
 
     return None
+
+
+_IGNORED_OZON_STYLE_KEYS = frozenset(
+    {
+        "textStyle",
+        "color",
+        "icon",
+        "type",
+        "id",
+        "widgetName",
+        "version",
+        "theme",
+        "backgroundColor",
+        "borderColor",
+        "align",
+        "weight",
+    }
+)
+
+
+def _collect_clean_leaf_strings(node: Any, out: list[str] | None = None) -> list[str]:
+    """Собирает все текстовые строки из JSON-дерева виджета Ozon, отбрасывая технические поля стилей (tsBody400Small и т.д.)."""
+    if out is None:
+        out = []
+    if isinstance(node, str):
+        s = node.strip()
+        if s and not s.startswith(("tsBody", "tsHeadline", "tsCompact", "ic_", "http://", "https://")):
+            out.append(s)
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            if k in _IGNORED_OZON_STYLE_KEYS:
+                continue
+            _collect_clean_leaf_strings(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_clean_leaf_strings(item, out)
+    return out
 
 
 def extract_ozon_avg_price_from_state(
     state: Any,
     *,
     actual_price_byn: float | None = None,
+    old_price_byn: float | None = None,
     default_currency: str = "BYN",
     rub_to_byn_rate: float = 0.0345,
 ) -> float | None:
-    """Рекурсивно ищет среднюю цену за месяц в JSON-состоянии виджетов Ozon."""
+    """Рекурсивно (снизу вверх по дереву JSON) ищет среднюю цену за месяц в состоянии виджетов Ozon."""
     if isinstance(state, dict):
-        # Прямые ключи средней цены, если присутствуют
+        # 1. Прямые ключи средней цены, если присутствуют
         for key in ("averagePrice", "avgPrice", "monthAvgPrice", "averageMonthPrice", "prevMonthAvgPrice"):
             if state.get(key):
                 val, curr = parse_price_value_and_currency(
                     state[key],
                     default_currency=default_currency,
-                    require_currency=True,
+                    require_currency=False,
                 )
                 byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
-                if _is_plausible_avg_price(byn_val, actual_price_byn):
+                if _is_plausible_avg_price(byn_val, actual_price_byn, old_price_byn):
                     return byn_val
 
-        # Если внутри словаря один из элементов содержит «Средняя за <месяц>», ищем строку ЦЕНЫ С ВАЛЮТОЙ в этом же словаре
-        dict_strings = [str(v) for v in state.values() if isinstance(v, str)]
-        combined_dict_str = " | ".join(dict_strings)
-        if AVG_MONTH_LABEL_RE.search(combined_dict_str):
-            for v in dict_strings:
-                if not AVG_MONTH_LABEL_RE.search(v):
-                    val, curr = parse_price_value_and_currency(
-                        v,
-                        default_currency=default_currency,
-                        require_currency=True,
-                    )
-                    byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
-                    if _is_plausible_avg_price(byn_val, actual_price_byn):
-                        return byn_val
+        # 2. Сначала рекурсивно проверяем дочерние узлы (поиск наименьшего общего предка LCA для «37,43 BYN» и «Средняя за ...»)
+        for k, v in state.items():
+            if k in _IGNORED_OZON_STYLE_KEYS:
+                continue
+            if isinstance(v, (dict, list)):
+                found = extract_ozon_avg_price_from_state(
+                    v,
+                    actual_price_byn=actual_price_byn,
+                    old_price_byn=old_price_byn,
+                    default_currency=default_currency,
+                    rub_to_byn_rate=rub_to_byn_rate,
+                )
+                if found is not None:
+                    return found
 
-        for v in state.values():
-            found = extract_ozon_avg_price_from_state(
-                v,
-                actual_price_byn=actual_price_byn,
-                default_currency=default_currency,
-                rub_to_byn_rate=rub_to_byn_rate,
-            )
-            if found is not None:
-                return found
+        # 3. Проверяем очищенные листовые строки текущего поддерева (без tsBody400Small / tsHeadline500Medium)
+        leaves = _collect_clean_leaf_strings(state)
+        if leaves:
+            joined_pipe = " | ".join(leaves)
+            if OZON_CHEAPER_BLOCK_RE.search(joined_pipe):
+                found_in_leaves = extract_avg_month_price_from_text(
+                    joined_pipe,
+                    actual_price_byn=actual_price_byn,
+                    old_price_byn=old_price_byn,
+                    default_currency=default_currency,
+                    rub_to_byn_rate=rub_to_byn_rate,
+                )
+                if found_in_leaves is not None:
+                    return found_in_leaves
+                # На случай если число и валюта лежали в соседних листовых строках ("37,43" и "BYN")
+                joined_space = " ".join(leaves)
+                found_in_space = extract_avg_month_price_from_text(
+                    joined_space,
+                    actual_price_byn=actual_price_byn,
+                    old_price_byn=old_price_byn,
+                    default_currency=default_currency,
+                    rub_to_byn_rate=rub_to_byn_rate,
+                )
+                if found_in_space is not None:
+                    return found_in_space
 
     elif isinstance(state, list):
-        for idx, item in enumerate(state):
-            # Если элемент списка содержит «Средняя за <месяц>», сначала проверяем предыдущий элемент (в Ozon цена идёт перед подписью)
-            if isinstance(item, (str, dict)) and AVG_MONTH_LABEL_RE.search(json.dumps(item, ensure_ascii=False)):
-                for neighbor_idx in (idx - 1, idx + 1):
-                    if 0 <= neighbor_idx < len(state):
-                        neighbor_dump = json.dumps(state[neighbor_idx], ensure_ascii=False)
-                        for m_p in STRICT_PRICE_WITH_CURRENCY_RE.finditer(neighbor_dump):
-                            raw_p = f"{m_p.group(1)} {m_p.group(2)}"
-                            val, curr = parse_price_value_and_currency(
-                                raw_p,
-                                default_currency=default_currency,
-                                require_currency=True,
-                            )
-                            byn_val = convert_to_byn(val, curr, rub_to_byn_rate)
-                            if _is_plausible_avg_price(byn_val, actual_price_byn):
-                                return byn_val
+        for item in state:
+            if isinstance(item, (dict, list)):
+                found = extract_ozon_avg_price_from_state(
+                    item,
+                    actual_price_byn=actual_price_byn,
+                    old_price_byn=old_price_byn,
+                    default_currency=default_currency,
+                    rub_to_byn_rate=rub_to_byn_rate,
+                )
+                if found is not None:
+                    return found
 
-            found = extract_ozon_avg_price_from_state(
-                item,
-                actual_price_byn=actual_price_byn,
-                default_currency=default_currency,
-                rub_to_byn_rate=rub_to_byn_rate,
-            )
-            if found is not None:
-                return found
+        leaves = _collect_clean_leaf_strings(state)
+        if leaves:
+            joined_pipe = " | ".join(leaves)
+            if OZON_CHEAPER_BLOCK_RE.search(joined_pipe):
+                found_in_leaves = extract_avg_month_price_from_text(
+                    joined_pipe,
+                    actual_price_byn=actual_price_byn,
+                    old_price_byn=old_price_byn,
+                    default_currency=default_currency,
+                    rub_to_byn_rate=rub_to_byn_rate,
+                )
+                if found_in_leaves is not None:
+                    return found_in_leaves
 
     return None
+
+
+def normalize_ozon_modal_path(raw_link: str) -> str | None:
+    """Преобразует ссылку или deeplink модального окна Ozon («Стало дешевле») в относительный путь для API."""
+    if not raw_link or not isinstance(raw_link, str):
+        return None
+    s = raw_link.strip().replace("\\/", "/")
+    if not s or len(s) > 1500:
+        return None
+    s_lower = s.lower()
+    if any(s_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".svg", ".gif", ".css", ".js", ".woff", ".woff2")):
+        return None
+    if s_lower.startswith("ozon://"):
+        s = "/" + s[len("ozon://"):].lstrip("/")
+    elif s_lower.startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(s)
+        except ValueError:
+            return None
+        s = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+    if not s.startswith("/"):
+        return None
+    s_lower = s.lower()
+    if "/page/json/v2" in s_lower and "url=" in s_lower:
+        with suppress(Exception):
+            qs = parse_qs(urlparse(s).query)
+            inner = unquote(qs.get("url", [""])[0])
+            if inner.startswith("/"):
+                return inner
+    if any(
+        k in s_lower
+        for k in (
+            "/modal/",
+            "modal=",
+            "pricedecrease",
+            "price_decrease",
+            "price-decrease",
+            "pricehistory",
+            "price_history",
+            "cheaper",
+            "stat=price",
+        )
+    ):
+        return s
+    return None
+
+
+def extract_ozon_price_modal_urls(payload: dict[str, Any]) -> list[str]:
+    """Извлекает пути модальных окон «Стало дешевле» из widgetStates ответа Ozon."""
+    if not isinstance(payload, dict):
+        return []
+
+    found_paths: list[str] = []
+
+    def _add_candidate(raw_val: Any, *, force_if_path: bool = False) -> None:
+        if not isinstance(raw_val, str):
+            return
+        norm = normalize_ozon_modal_path(raw_val)
+        if norm and norm not in found_paths:
+            found_paths.append(norm)
+            return
+        if force_if_path:
+            s = raw_val.strip().replace("\\/", "/")
+            if s.startswith("ozon://"):
+                s = "/" + s[len("ozon://"):].lstrip("/")
+            elif s.startswith(("http://", "https://")):
+                with suppress(ValueError):
+                    p = urlparse(s)
+                    s = (p.path or "/") + (f"?{p.query}" if p.query else "")
+            if (
+                s.startswith("/")
+                and not s.startswith(("/product/", "/brand/", "/category/", "/seller/", "/s/", "/search/"))
+                and not any(s.lower().endswith(ext) for ext in (".jpg", ".png", ".webp", ".svg", ".gif"))
+                and s not in found_paths
+            ):
+                found_paths.append(s)
+
+    def _walk_node(node: Any, in_cheaper_context: bool = False) -> None:
+        if isinstance(node, dict):
+            node_dump_lower = json.dumps(node, ensure_ascii=False).lower()
+            has_cheaper = in_cheaper_context or ("стало дешевле" in node_dump_lower) or ("pricedecrease" in node_dump_lower)
+            # Если этот узел небольшой и непосредственно описывает кнопку «Стало дешевле», берём любые его ссылки
+            is_tight_cheaper = ("стало дешевле" in node_dump_lower) and len(node_dump_lower) < 1200
+            for k, v in node.items():
+                k_lower = str(k).lower()
+                if isinstance(v, str):
+                    if k_lower in ("link", "deeplink", "url", "modalurl", "uri", "href", "action", "path", "targeturl", "contenturl"):
+                        _add_candidate(v, force_if_path=is_tight_cheaper)
+                    elif has_cheaper:
+                        _add_candidate(v, force_if_path=False)
+                elif isinstance(v, (dict, list)):
+                    _walk_node(v, has_cheaper)
+        elif isinstance(node, list):
+            for item in node:
+                _walk_node(item, in_cheaper_context)
+
+    widget_states = payload.get("widgetStates")
+    if isinstance(widget_states, dict):
+        for w_key, raw_state in widget_states.items():
+            if not isinstance(raw_state, str) or not raw_state.strip():
+                continue
+            w_lower = w_key.lower()
+            raw_lower = raw_state.lower()
+            if "webprice" in w_lower or "pricedecrease" in w_lower or "стало дешевле" in raw_lower or "modal" in raw_lower:
+                with suppress(Exception):
+                    parsed_st = json.loads(raw_state)
+                    _walk_node(parsed_st, "pricedecrease" in w_lower or "стало дешевле" in raw_lower)
+
+    return found_paths
 
 
 def get_wb_basket_host(vol: int) -> str:
@@ -1889,17 +2173,29 @@ def parse_ozon_composer_payload(
 
     # Второй проход по widgetStates: ищем среднюю цену за месяц («Стало дешевле» / «Средняя за ...»)
     for key_lower, state, raw_state in parsed_states:
-        if "webprice" in key_lower or "pricedecrease" in key_lower or "pricehistory" in key_lower or "средняя за" in raw_state.lower() or "стало дешевле" in raw_state.lower():
+        raw_lower = raw_state.lower()
+        if (
+            "webprice" in key_lower
+            or "pricedecrease" in key_lower
+            or "pricehistory" in key_lower
+            or "modal" in key_lower
+            or "средн" in raw_lower
+            or "стало дешевле" in raw_lower
+            or "цена сейчас" in raw_lower
+        ):
             found_avg = extract_ozon_avg_price_from_state(
                 state,
                 actual_price_byn=price_byn,
+                old_price_byn=old_price_byn,
                 default_currency=default_currency,
                 rub_to_byn_rate=rub_to_byn_rate,
             )
             if found_avg is None:
+                decoded_state_str = json.dumps(state, ensure_ascii=False)
                 found_avg = extract_avg_month_price_from_text(
-                    raw_state,
+                    decoded_state_str,
                     actual_price_byn=price_byn,
+                    old_price_byn=old_price_byn,
                     default_currency=default_currency,
                     rub_to_byn_rate=rub_to_byn_rate,
                 )
@@ -1907,12 +2203,21 @@ def parse_ozon_composer_payload(
                 avg_month_price_byn = found_avg
                 break
 
-    # Проверяем общий текст ответа на среднюю цену за месяц, если в отдельных виджетах не нашли
+    # Проверяем общий дерево/текст ответа на среднюю цену за месяц, если в отдельных виджетах не нашли
+    if avg_month_price_byn is None:
+        avg_month_price_byn = extract_ozon_avg_price_from_state(
+            payload,
+            actual_price_byn=price_byn,
+            old_price_byn=old_price_byn,
+            default_currency=default_currency,
+            rub_to_byn_rate=rub_to_byn_rate,
+        )
     if avg_month_price_byn is None:
         full_dump = json.dumps(payload, ensure_ascii=False)
         avg_month_price_byn = extract_avg_month_price_from_text(
             full_dump,
             actual_price_byn=price_byn,
+            old_price_byn=old_price_byn,
             default_currency=default_currency,
             rub_to_byn_rate=rub_to_byn_rate,
         )
@@ -2797,7 +3102,17 @@ class OzonBrowserResolver:
         *,
         rub_to_byn_rate: float = 0.0345,
     ) -> tuple[ProductCardData | None, list[dict]]:
-        """Получает данные карточки товара Ozon (название, цена в BYN, средняя цена за месяц, главное фото, наличие) через браузер."""
+        """Получает данные карточки товара Ozon (название, цена в BYN, средняя цена за месяц, главное фото, наличие) через браузер.
+
+        Оптимизированный многоуровневый алгоритм для «Стало дешевле»:
+        1. In-page API через прогретую вкладку (warm_page): за ~100 мс запрашивает JSON карточки товара,
+           а при наличии ссылок на модальное окно «Стало дешевле» в widgetStates — сразу же подгружает JSON модалки
+           в том же вызове без открытия новой вкладки.
+        2. Если средняя цена не пришла в in-page API (требуется интерактивное открытие попапа):
+           открывает лёгкую вкладку с блокировкой тяжёлых медиа/картинок/шрифтов, перехватывает все XHR-ответы
+           модальных окон Ozon, кликает по «Стало дешевле» (Playwright + JS fallback) и ждёт появления
+           «Средняя за ...» / «Цена сейчас» в портале модального окна или в сетевом ответе.
+        """
         if not self._available or not sku:
             return None, []
 
@@ -2821,12 +3136,13 @@ class OzonBrowserResolver:
 
                 if warm_page is not None:
                     with suppress(Exception):
-                        raw_json_str = await warm_page.evaluate(
+                        inpage_bundle_str = await warm_page.evaluate(
                             """async ({ encodedPath }) => {
                                 const endpoints = [
                                     `/api/entrypoint-api.bx/page/json/v2?url=${encodedPath}`,
                                     `/api/composer-api.bx/page/json/v2?url=${encodedPath}`
                                 ];
+                                let mainText = '';
                                 for (const ep of endpoints) {
                                     try {
                                         const resp = await fetch(ep, {
@@ -2840,46 +3156,252 @@ class OzonBrowserResolver:
                                         }
                                         const text = await resp.text();
                                         if (text && (text.includes('widgetStates') || text.includes('"seo"'))) {
-                                            return text;
+                                            mainText = text;
+                                            break;
                                         }
                                     } catch (e) {}
                                 }
-                                return '';
+                                if (!mainText) return '';
+
+                                const modalTexts = [];
+                                try {
+                                    const lowerMain = mainText.toLowerCase();
+                                    if (lowerMain.includes('стало дешевле') || lowerMain.includes('pricedecrease') || lowerMain.includes('/modal/')) {
+                                        const parsed = JSON.parse(mainText);
+                                        const ws = (parsed && parsed.widgetStates) || {};
+                                        const candidateModalUrls = new Set();
+                                        const collectLinks = (obj, inCheaper) => {
+                                            if (!obj || typeof obj !== 'object') return;
+                                            const dump = JSON.stringify(obj).toLowerCase();
+                                            const hasCheaper = inCheaper || dump.includes('стало дешевле') || dump.includes('pricedecrease');
+                                            const isTight = dump.includes('стало дешевле') && dump.length < 1200;
+                                            for (const [k, v] of Object.entries(obj)) {
+                                                const kl = k.toLowerCase();
+                                                if (typeof v === 'string') {
+                                                    let s = v.trim().replace(/\\\\\\//g, '/');
+                                                    if (s.startsWith('ozon://')) s = '/' + s.slice(7).replace(/^\\/+/, '');
+                                                    const sl = s.toLowerCase();
+                                                    const isModalHint = (
+                                                        sl.includes('/modal/') ||
+                                                        sl.includes('modal=') ||
+                                                        sl.includes('pricedecrease') ||
+                                                        sl.includes('price_decrease') ||
+                                                        sl.includes('price-decrease') ||
+                                                        sl.includes('cheaper') ||
+                                                        sl.includes('stat=price')
+                                                    );
+                                                    const isLinkKey = ['link', 'deeplink', 'url', 'modalurl', 'uri', 'href', 'action', 'path', 'targeturl'].includes(kl);
+                                                    if (s.startsWith('/') && (isModalHint || (isTight && isLinkKey && !sl.startsWith('/product/')))) {
+                                                        candidateModalUrls.add(s);
+                                                    }
+                                                } else if (v && typeof v === 'object') {
+                                                    collectLinks(v, hasCheaper);
+                                                }
+                                            }
+                                        };
+                                        for (const [wKey, rawState] of Object.entries(ws)) {
+                                            if (typeof rawState !== 'string') continue;
+                                            const wl = wKey.toLowerCase();
+                                            const rl = rawState.toLowerCase();
+                                            if (wl.includes('webprice') || wl.includes('pricedecrease') || rl.includes('стало дешевле') || rl.includes('modal')) {
+                                                try {
+                                                    collectLinks(JSON.parse(rawState), rl.includes('стало дешевле'));
+                                                } catch (e) {}
+                                            }
+                                        }
+                                        for (const mPath of Array.from(candidateModalUrls).slice(0, 3)) {
+                                            try {
+                                                const encM = encodeURIComponent(mPath);
+                                                const mResp = await fetch(`/api/entrypoint-api.bx/page/json/v2?url=${encM}`, {
+                                                    method: 'GET',
+                                                    credentials: 'include',
+                                                    headers: { 'Accept': 'application/json' }
+                                                });
+                                                if (mResp.ok) {
+                                                    const mTxt = await mResp.text();
+                                                    if (mTxt) modalTexts.push(mTxt);
+                                                }
+                                            } catch (e) {}
+                                        }
+                                    }
+                                } catch (e) {}
+
+                                return JSON.stringify({ main: mainText, modals: modalTexts });
                             }""",
                             {"encodedPath": encoded_path},
                         )
-                        if raw_json_str:
-                            data = json.loads(raw_json_str)
-                            if isinstance(data, dict):
-                                if data.get("_not_found"):
+                        if inpage_bundle_str:
+                            bundle = json.loads(inpage_bundle_str)
+                            if isinstance(bundle, dict):
+                                if bundle.get("_not_found"):
                                     cookies = await self._export_cookies()
                                     return ProductCardData(in_stock=False), cookies
-                                inpage_card = parse_ozon_composer_payload(
-                                    data,
-                                    default_currency=default_currency,
-                                    rub_to_byn_rate=rub_to_byn_rate,
-                                )
-                                if inpage_card and inpage_card.in_stock is False:
-                                    cookies = await self._export_cookies()
-                                    return inpage_card, cookies
-                                if (
-                                    inpage_card
-                                    and inpage_card.title
-                                    and inpage_card.price_byn is not None
-                                    and inpage_card.image_url
-                                    and inpage_card.avg_month_price_byn is not None
-                                ):
-                                    cookies = await self._export_cookies()
-                                    log(
-                                        f"Карточка Ozon {sku} полностью получена через in-page API ({domain}): "
-                                        f"price={inpage_card.price_byn} BYN, avg={inpage_card.avg_month_price_byn} BYN"
+                                raw_main = bundle.get("main") or ""
+                                modal_list = bundle.get("modals") or []
+                                data = json.loads(raw_main) if raw_main else None
+                                if isinstance(data, dict):
+                                    inpage_card = parse_ozon_composer_payload(
+                                        data,
+                                        default_currency=default_currency,
+                                        rub_to_byn_rate=rub_to_byn_rate,
                                     )
-                                    return inpage_card, cookies
+                                    if inpage_card and inpage_card.in_stock is False:
+                                        cookies = await self._export_cookies()
+                                        return inpage_card, cookies
 
-                # Открываем страницу товара во вкладке для извлечения DOM / попапа «Стало дешевле» / фото
+                                    # Если средняя цена не нашлась в основном ответе, проверяем подгруженные JSON модальных окон
+                                    if inpage_card and inpage_card.avg_month_price_byn is None:
+                                        extra_modal_urls = extract_ozon_price_modal_urls(data)
+                                        for m_raw in modal_list:
+                                            with suppress(Exception):
+                                                m_data = json.loads(m_raw)
+                                                m_avg = extract_ozon_avg_price_from_state(
+                                                    m_data,
+                                                    actual_price_byn=inpage_card.price_byn,
+                                                    old_price_byn=inpage_card.old_price_byn,
+                                                    default_currency=default_currency,
+                                                    rub_to_byn_rate=rub_to_byn_rate,
+                                                ) or extract_avg_month_price_from_text(
+                                                    m_raw,
+                                                    actual_price_byn=inpage_card.price_byn,
+                                                    old_price_byn=inpage_card.old_price_byn,
+                                                    default_currency=default_currency,
+                                                    rub_to_byn_rate=rub_to_byn_rate,
+                                                )
+                                                if m_avg is not None:
+                                                    inpage_card = replace(inpage_card, avg_month_price_byn=m_avg)
+                                                    break
+
+                                        # Если в Python нашлись дополнительные пути модалок, догружаем их через warm_page
+                                        if inpage_card.avg_month_price_byn is None and extra_modal_urls and not modal_list:
+                                            for m_path in extra_modal_urls[:2]:
+                                                with suppress(Exception):
+                                                    enc_m = quote(m_path, safe="/?=&")
+                                                    m_str = await warm_page.evaluate(
+                                                        """async ({ encM }) => {
+                                                            try {
+                                                                const r = await fetch(`/api/entrypoint-api.bx/page/json/v2?url=${encM}`, {
+                                                                    credentials: 'include',
+                                                                    headers: { 'Accept': 'application/json' }
+                                                                });
+                                                                return r.ok ? await r.text() : '';
+                                                            } catch (e) { return ''; }
+                                                        }""",
+                                                        {"encM": enc_m},
+                                                    )
+                                                    if m_str:
+                                                        m_obj = json.loads(m_str)
+                                                        m_avg = extract_ozon_avg_price_from_state(
+                                                            m_obj,
+                                                            actual_price_byn=inpage_card.price_byn,
+                                                            old_price_byn=inpage_card.old_price_byn,
+                                                            default_currency=default_currency,
+                                                            rub_to_byn_rate=rub_to_byn_rate,
+                                                        ) or extract_avg_month_price_from_text(
+                                                            m_str,
+                                                            actual_price_byn=inpage_card.price_byn,
+                                                            old_price_byn=inpage_card.old_price_byn,
+                                                            default_currency=default_currency,
+                                                            rub_to_byn_rate=rub_to_byn_rate,
+                                                        )
+                                                        if m_avg is not None:
+                                                            inpage_card = replace(inpage_card, avg_month_price_byn=m_avg)
+                                                            break
+
+                                    if (
+                                        inpage_card
+                                        and inpage_card.title
+                                        and inpage_card.price_byn is not None
+                                        and inpage_card.image_url
+                                        and inpage_card.avg_month_price_byn is not None
+                                    ):
+                                        cookies = await self._export_cookies()
+                                        log(
+                                            f"Карточка Ozon {sku} полностью получена через in-page API ({domain}): "
+                                            f"price={inpage_card.price_byn} BYN, avg={inpage_card.avg_month_price_byn} BYN"
+                                        )
+                                        return inpage_card, cookies
+
+                # Открываем страницу товара во вкладке для извлечения DOM / попапа «Стало дешевле» / перехвата XHR модалки
                 assert self._context is not None
                 nav_page = await self._context.new_page()
                 await self._apply_cdp_stealth(nav_page)
+
+                intercepted_avg_byn: float | None = None
+                intercepted_card: ProductCardData | None = None
+
+                # Блокируем загрузку тяжёлых картинок, видео и шрифтов на вкладке-доноре, чтобы страница и Vue-гидратация загружались в 3 раза быстрее
+                async def _fast_route_handler(route) -> None:
+                    with suppress(Exception):
+                        if route.request.resource_type in {"image", "media", "font"}:
+                            await route.abort()
+                            return
+                        await route.continue_()
+
+                with suppress(Exception):
+                    await nav_page.route("**/*", _fast_route_handler)
+
+                async def _handle_ozon_response(resp, curr: str = default_currency) -> None:
+                    nonlocal intercepted_avg_byn, intercepted_card
+                    with suppress(Exception):
+                        r_url = (resp.url or "").lower()
+                        if resp.status < 200 or resp.status >= 300:
+                            return
+                        if (
+                            "/entrypoint-api.bx/" in r_url
+                            or "/composer-api.bx/" in r_url
+                            or "/modal/" in r_url
+                            or "pricedecrease" in r_url
+                        ):
+                            raw_bytes = await resp.body()
+                            if not raw_bytes:
+                                return
+                            txt = raw_bytes.decode("utf-8", errors="ignore")
+                            if not txt:
+                                return
+                            ref_price = (
+                                (inpage_card.price_byn if inpage_card else None)
+                                or (intercepted_card.price_byn if intercepted_card else None)
+                            )
+                            ref_old = (
+                                (inpage_card.old_price_byn if inpage_card else None)
+                                or (intercepted_card.old_price_byn if intercepted_card else None)
+                            )
+                            payload_obj = json.loads(txt)
+                            if isinstance(payload_obj, dict):
+                                if "widgetStates" in payload_obj or "seo" in payload_obj:
+                                    parsed_resp = parse_ozon_composer_payload(
+                                        payload_obj,
+                                        default_currency=curr,
+                                        rub_to_byn_rate=rub_to_byn_rate,
+                                    )
+                                    if parsed_resp is not None:
+                                        intercepted_card = merge_card_data(intercepted_card, parsed_resp)
+                                        if parsed_resp.avg_month_price_byn is not None:
+                                            intercepted_avg_byn = parsed_resp.avg_month_price_byn
+                                            return
+                                found_avg = extract_ozon_avg_price_from_state(
+                                    payload_obj,
+                                    actual_price_byn=ref_price,
+                                    old_price_byn=ref_old,
+                                    default_currency=curr,
+                                    rub_to_byn_rate=rub_to_byn_rate,
+                                )
+                                if found_avg is not None:
+                                    intercepted_avg_byn = found_avg
+                                    return
+                            found_txt_avg = extract_avg_month_price_from_text(
+                                txt,
+                                actual_price_byn=ref_price,
+                                old_price_byn=ref_old,
+                                default_currency=curr,
+                                rub_to_byn_rate=rub_to_byn_rate,
+                            )
+                            if found_txt_avg is not None:
+                                intercepted_avg_byn = found_txt_avg
+
+                nav_page.on("response", lambda r: asyncio.create_task(_handle_ozon_response(r)))
+
                 target_url = f"https://{domain}/product/{sku}/" if domain == "ozon.by" else f"https://www.{domain}/product/{sku}/"
                 try:
                     resp = await nav_page.goto(target_url, wait_until="domcontentloaded", timeout=11_000)
@@ -2887,14 +3409,85 @@ class OzonBrowserResolver:
                         cookies = await self._export_cookies()
                         return ProductCardData(in_stock=False), cookies
 
-                    await asyncio.sleep(0.8)
+                    # Ожидаем появления кнопки «Стало дешевле» (или уже отрисованной «Средняя за ...») до 3.2 сек
+                    wait_deadline = time.monotonic() + 3.2
+                    cheaper_found = False
+                    while time.monotonic() < wait_deadline:
+                        if intercepted_avg_byn is not None:
+                            break
+                        with suppress(Exception):
+                            state_check = await nav_page.evaluate(
+                                """() => {
+                                    const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                                    if (txt.includes('средняя за') || txt.includes('цена сейчас')) return 'modal_ready';
+                                    if (txt.includes('стало дешевле')) return 'button_ready';
+                                    return '';
+                                }"""
+                            )
+                            if state_check == "modal_ready":
+                                break
+                            if state_check == "button_ready":
+                                cheaper_found = True
+                                break
+                        await asyncio.sleep(0.22)
 
-                    # Если на странице есть кнопка «Стало дешевле», кликаем по ней, чтобы открыть попап со «Средняя за <месяц>»
-                    with suppress(Exception):
-                        cheaper_el = await nav_page.query_selector("text=Стало дешевле")
-                        if cheaper_el:
-                            await cheaper_el.click(timeout=1500)
-                            await asyncio.sleep(0.45)
+                    # Если кнопка «Стало дешевле» найдена, кликаем по ней (Playwright + JS) и ждём открытия попапа / XHR-ответа
+                    if cheaper_found and intercepted_avg_byn is None:
+                        for click_attempt in range(2):
+                            with suppress(Exception):
+                                for sel in (
+                                    '[data-widget="webPrice"] >> text=Стало дешевле',
+                                    'text=Стало дешевле',
+                                ):
+                                    cheaper_el = await nav_page.query_selector(sel)
+                                    if cheaper_el:
+                                        await cheaper_el.click(timeout=1200, force=True)
+                                        break
+                            with suppress(Exception):
+                                await nav_page.evaluate(
+                                    """() => {
+                                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                                        let node;
+                                        while ((node = walker.nextNode())) {
+                                            if (node.nodeValue && node.nodeValue.toLowerCase().includes('стало дешевле')) {
+                                                const el = node.parentElement;
+                                                if (!el) continue;
+                                                const clickable = el.closest('button, a, [role="button"], [tabindex]') || el;
+                                                for (const target of [clickable, el, el.parentElement]) {
+                                                    if (!target) continue;
+                                                    try { target.click(); } catch (e) {}
+                                                    try {
+                                                        target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                                                        target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                                                        target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                                    } catch (e) {}
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }"""
+                                )
+
+                            # Ждём появления текста модального окна («Средняя за ...» / «Цена сейчас») или перехвата XHR
+                            popup_deadline = time.monotonic() + (1.1 if click_attempt == 0 else 1.4)
+                            modal_appeared = False
+                            while time.monotonic() < popup_deadline:
+                                if intercepted_avg_byn is not None:
+                                    modal_appeared = True
+                                    break
+                                with suppress(Exception):
+                                    has_modal_txt = await nav_page.evaluate(
+                                        """() => {
+                                            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                                            return txt.includes('средняя за') || txt.includes('цена сейчас');
+                                        }"""
+                                    )
+                                    if has_modal_txt:
+                                        modal_appeared = True
+                                        break
+                                await asyncio.sleep(0.14)
+                            if modal_appeared:
+                                break
 
                     html_content = await nav_page.content()
                     dom_card = parse_html_product_card(
@@ -2903,35 +3496,72 @@ class OzonBrowserResolver:
                         rub_to_byn_rate=rub_to_byn_rate,
                     )
 
-                    # Дополнительно проверяем видимый текст страницы и главное фото галереи через JS
+                    # Дополнительно проверяем текст открытого модального окна, весь видимый текст страницы и главное фото через JS
                     with suppress(Exception):
                         dom_extra = await nav_page.evaluate(
                             """() => {
+                                const modalSelectors = [
+                                    '[role="dialog"]',
+                                    '[aria-modal="true"]',
+                                    '.vue-portal-target',
+                                    '[data-widget*="Modal"]',
+                                    '[data-widget*="Price"]',
+                                    '[class*="modal"]',
+                                    '[class*="popover"]'
+                                ];
+                                const modalParts = [];
+                                for (const sel of modalSelectors) {
+                                    for (const el of document.querySelectorAll(sel)) {
+                                        const t = (el.innerText || el.textContent || '').trim();
+                                        if (t && (t.toLowerCase().includes('средн') || t.toLowerCase().includes('стало дешевле') || t.toLowerCase().includes('цена сейчас'))) {
+                                            modalParts.push(t);
+                                        }
+                                    }
+                                }
                                 const bodyText = document.body ? document.body.innerText : '';
                                 const galleryImg = document.querySelector('[data-widget="webGallery"] img, [data-widget="webMobGallery"] img');
                                 return {
-                                    bodyText: bodyText.slice(0, 60000),
+                                    modalText: modalParts.join(' \\n '),
+                                    bodyText: bodyText.length > 120000 ? (bodyText.slice(0, 60000) + ' \\n ' + bodyText.slice(-60000)) : bodyText,
                                     imgSrc: galleryImg ? (galleryImg.currentSrc || galleryImg.src || '') : ''
                                 };
                             }"""
                         )
                         if isinstance(dom_extra, dict):
                             extra_img = normalize_image_url(dom_extra.get("imgSrc"))
+                            modal_text = str(dom_extra.get("modalText") or "")
                             body_text = str(dom_extra.get("bodyText") or "")
                             ref_price = (
                                 (inpage_card.price_byn if inpage_card else None)
+                                or (intercepted_card.price_byn if intercepted_card else None)
                                 or (dom_card.price_byn if dom_card else None)
                             )
-                            extra_avg = extract_avg_month_price_from_text(
-                                body_text,
-                                actual_price_byn=ref_price,
-                                default_currency=default_currency,
-                                rub_to_byn_rate=rub_to_byn_rate,
+                            ref_old = (
+                                (inpage_card.old_price_byn if inpage_card else None)
+                                or (intercepted_card.old_price_byn if intercepted_card else None)
+                                or (dom_card.old_price_byn if dom_card else None)
+                            )
+                            extra_avg = (
+                                intercepted_avg_byn
+                                or extract_avg_month_price_from_text(
+                                    modal_text,
+                                    actual_price_byn=ref_price,
+                                    old_price_byn=ref_old,
+                                    default_currency=default_currency,
+                                    rub_to_byn_rate=rub_to_byn_rate,
+                                )
+                                or extract_avg_month_price_from_text(
+                                    body_text,
+                                    actual_price_byn=ref_price,
+                                    old_price_byn=ref_old,
+                                    default_currency=default_currency,
+                                    rub_to_byn_rate=rub_to_byn_rate,
+                                )
                             )
                             if dom_card:
                                 dom_card = replace(
                                     dom_card,
-                                    avg_month_price_byn=dom_card.avg_month_price_byn or extra_avg,
+                                    avg_month_price_byn=extra_avg or dom_card.avg_month_price_byn,
                                     image_url=dom_card.image_url or extra_img,
                                 )
                             elif extra_avg or extra_img:
@@ -2941,7 +3571,11 @@ class OzonBrowserResolver:
                                     raw_currency=default_currency,
                                 )
 
-                    merged = merge_card_data(inpage_card, dom_card)
+                    merged = merge_card_data(inpage_card, intercepted_card)
+                    merged = merge_card_data(merged, dom_card)
+                    if intercepted_avg_byn is not None and merged and merged.avg_month_price_byn is None:
+                        merged = replace(merged, avg_month_price_byn=intercepted_avg_byn)
+
                     if merged and (merged.in_stock is False or (merged.title and merged.price_byn is not None)):
                         cookies = await self._export_cookies()
                         log(
@@ -4242,22 +4876,48 @@ class ParserApp:
         for host in storefronts:
             default_curr = "BYN" if host == "ozon.by" else "RUB"
             endpoints = (
+                f"https://{host}/api/entrypoint-api.bx/page/json/v2?url={encoded_path}",
                 f"https://www.{host}/api/entrypoint-api.bx/page/json/v2?url={encoded_path}",
                 f"https://api.{host}/composer-api.bx/page/json/v2?url={encoded_path}",
                 f"https://www.{host}/api/composer-api.bx/page/json/v2?url={encoded_path}",
             )
             for ep_url in endpoints:
                 payload = await self._fetch_json_url(ep_url, headers=OZON_APP_HEADERS)
-                if not payload:
+                if not payload or "_http_status" in payload:
+                    if payload and payload.get("_http_status") == 404:
+                        return ProductCardData(in_stock=False)
                     continue
-                if payload.get("_http_status") == 404:
-                    return ProductCardData(in_stock=False)
                 parsed = parse_ozon_composer_payload(
                     payload,
                     default_currency=default_curr,
                     rub_to_byn_rate=rub_rate,
                 )
                 if parsed is not None:
+                    # Если средняя цена не нашлась напрямую, но в widgetStates есть ссылка на модальное окно «Стало дешевле»
+                    if parsed.avg_month_price_byn is None:
+                        modal_urls = extract_ozon_price_modal_urls(payload)
+                        for m_path in modal_urls[:2]:
+                            enc_m = quote(m_path, safe="/?=&")
+                            m_ep = f"https://{host}/api/entrypoint-api.bx/page/json/v2?url={enc_m}"
+                            m_payload = await self._fetch_json_url(m_ep, headers=OZON_APP_HEADERS, timeout_override=4.0)
+                            if m_payload and "_http_status" not in m_payload:
+                                m_avg = extract_ozon_avg_price_from_state(
+                                    m_payload,
+                                    actual_price_byn=parsed.price_byn,
+                                    old_price_byn=parsed.old_price_byn,
+                                    default_currency=default_curr,
+                                    rub_to_byn_rate=rub_rate,
+                                ) or extract_avg_month_price_from_text(
+                                    json.dumps(m_payload, ensure_ascii=False),
+                                    actual_price_byn=parsed.price_byn,
+                                    old_price_byn=parsed.old_price_byn,
+                                    default_currency=default_curr,
+                                    rub_to_byn_rate=rub_rate,
+                                )
+                                if m_avg is not None:
+                                    parsed = replace(parsed, avg_month_price_byn=m_avg)
+                                    break
+
                     card_data = merge_card_data(card_data, parsed)
                     if card_data.in_stock is False:
                         return card_data
@@ -4387,24 +5047,11 @@ class ParserApp:
                 return None
 
         if self.settings.require_price and (card is None or card.price_byn is None or card.price_byn <= 0):
-            # Если для Wildberries публичный API цен заблокирован (403), но карточка товара подтверждена на CDN/в браузере
-            # и товар не числится отсутствующим, публикуем карточку без строки цены вместо ложной отмены
-            if (
-                product.platform == "Wildberries"
-                and card is not None
-                and card.in_stock is True
-                and (card.title or product.title)
-            ):
-                log(
-                    f"Для товара Wildberries (арт. {product.sku}) API цен временно недоступен, "
-                    f"но карточка активна — публикуем без указания цены"
-                )
-            else:
-                log(
-                    f"Для товара {product.platform} (арт. {product.sku}) не найдена актуальная цена / нет в наличии — "
-                    f"публикация отменена"
-                )
-                return None
+            log(
+                f"Для товара {product.platform} (арт. {product.sku}) не найдена актуальная цена / нет в наличии — "
+                f"публикация отменена"
+            )
+            return None
 
         if card is None:
             return product
@@ -4602,7 +5249,7 @@ class ParserApp:
 
         clean_url = strip_antibot_params(url)
         host = normalize_host(urlparse(clean_url).hostname)
-        if not (is_ozon_host(host) or is_wb_host(host)):
+        if not is_ozon_host(host):
             return clean_url
 
         if prefetched_body:
@@ -5002,7 +5649,7 @@ class ParserApp:
                 self.enrich_product_with_card(
                     product,
                     messages=job.messages,
-                    source_text=source_text if len(fresh_candidates) == 1 else "",
+                    source_text=source_text,
                 )
                 for product in fresh_candidates
             ),
