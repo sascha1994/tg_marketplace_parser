@@ -9,15 +9,23 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from telethon.tl.types import MessageEntityStrike, MessageEntityUrl
 from tg_marketplace_parser.market_data import MarketDataMixin
+from tg_marketplace_parser.message_parsing import extract_product_url_from_text
 from tg_marketplace_parser.config import Settings
 from tg_marketplace_parser.admin import AdminMixin
+from tg_marketplace_parser.common import (
+    has_expanded_product_url,
+    has_product_sku,
+    ozon_product_path,
+)
 from tg_marketplace_parser.marketplace_parsing import (
     merge_card_data,
     parse_wb_detail_payload,
 )
 from tg_marketplace_parser.models import ProductCardData, ProductInfo
 from tg_marketplace_parser.pipeline import PipelineMixin
+from tg_marketplace_parser.presentation import build_publication_text, parse_product_info
 from tg_marketplace_parser.storage import DuplicateDB
 
 
@@ -34,6 +42,129 @@ def make_product(platform="Wildberries", sku="12345", **kwargs):
 
 
 class InventoryTests(unittest.IsolatedAsyncioTestCase):
+    def test_ozon_sold_out_redirect_path_is_recognized_as_product(self):
+        url = "https://ozon.ru/p/o4279370?short=cF1FVro"
+
+        self.assertTrue(has_product_sku(url))
+        self.assertFalse(has_expanded_product_url(url))
+        product = parse_product_info(
+            "https://ozon.by/t/cF1FVro",
+            url,
+            canonical_host_override="ozon.by",
+        )
+        self.assertEqual(product.platform, "Ozon")
+        self.assertEqual(product.sku, "o4279370")
+        self.assertEqual(product.sku_key, "ozon:short:o4279370")
+        self.assertEqual(product.canonical_url, "https://ozon.by/p/o4279370")
+        self.assertEqual(ozon_product_path(product.sku), "/p/o4279370")
+        self.assertEqual(
+            ozon_product_path(
+                "1440302046",
+                "https://ozon.by/product/1440302046/",
+            ),
+            "/product/1440302046/",
+        )
+        self.assertEqual(
+            ozon_product_path(
+                "1440302046",
+                "https://example.com/product/1440302046/",
+            ),
+            "/product/1440302046/",
+        )
+        self.assertIsNone(
+            extract_product_url_from_text(
+                '<link rel="canonical" href="https://ozon.ru/p/o4279370?short=cF1FVro">',
+                "https://ozon.ru/",
+            )
+        )
+
+    async def test_unexpanded_ozon_product_path_is_not_returned_for_publication(self):
+        short_url = "https://ozon.ru/p/o4279370?short=cF1FVro"
+
+        class FakeMarketData(MarketDataMixin):
+            settings = SimpleNamespace(max_redirects=0)
+            curl_session = None
+            http_session = object()
+            state = SimpleNamespace(http_resolved=0, browser_resolved=0)
+            host_has_only_public_ips = AsyncMock(return_value=True)
+            _request_step = AsyncMock(return_value=(403, None, None, b""))
+            upgrade_to_product_url = AsyncMock(return_value=short_url)
+
+        parser = FakeMarketData()
+        resolved = await MarketDataMixin.resolve_url(
+            parser,
+            short_url,
+        )
+
+        self.assertIsNone(resolved)
+        parser.upgrade_to_product_url.assert_awaited_once()
+
+    def test_publication_text_omits_unexpanded_ozon_links(self):
+        product = parse_product_info(
+            "https://ozon.by/t/cF1FVro",
+            "https://ozon.ru/p/o4279370",
+            canonical_host_override="ozon.by",
+        )
+
+        self.assertEqual(build_publication_text("", [product]), "")
+
+    def test_publication_text_keeps_expanded_ozon_links(self):
+        product = parse_product_info(
+            "https://ozon.by/t/cF1FVro",
+            "https://ozon.ru/product/1440302046/",
+            canonical_host_override="ozon.by",
+        )
+
+        text = build_publication_text("", [product])
+        self.assertIn("https://ozon.by/product/1440302046/", text)
+
+    async def test_ozon_card_lookup_uses_saved_canonical_product_path(self):
+        requested_urls = []
+
+        async def fetch_json(url, **kwargs):
+            requested_urls.append(url)
+            return {"_http_status": 404}
+
+        parser = SimpleNamespace(
+            settings=SimpleNamespace(ozon_preferred_storefronts=()),
+            browser_resolver=SimpleNamespace(is_available=False),
+            curl_session=None,
+            http_session=object(),
+            get_rub_to_byn_rate=AsyncMock(return_value=0.0345),
+            _fetch_json_url=AsyncMock(side_effect=fetch_json),
+        )
+
+        card = await MarketDataMixin.fetch_ozon_card_data(
+            parser,
+            "1440302046",
+            canonical_url="https://ozon.by/product/1440302046/",
+        )
+
+        self.assertFalse(card.in_stock)
+        self.assertTrue(requested_urls)
+        self.assertIn("url=/product/1440302046/", requested_urls[0])
+
+    async def test_published_product_check_passes_its_canonical_url(self):
+        fetch_ozon_card = AsyncMock(return_value=ProductCardData(in_stock=False))
+        parser = SimpleNamespace(fetch_ozon_card_data=fetch_ozon_card)
+        product = ProductInfo(
+            original_url="https://ozon.by/t/example",
+            resolved_url="https://ozon.ru/product/1440302046/",
+            platform="Ozon",
+            sku="1440302046",
+            canonical_url="https://ozon.by/product/1440302046/",
+            sku_key="ozon:1440302046",
+        )
+
+        await PipelineMixin.fetch_card_for_product(parser, product)
+
+        fetch_ozon_card.assert_awaited_once_with(
+            "1440302046",
+            original_url="https://ozon.by/t/example",
+            messages=(),
+            canonical_url="https://ozon.by/product/1440302046/",
+        )
+
     def parse_stock(self, quantity):
         return parse_wb_detail_payload(
             {
@@ -172,6 +303,50 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(handled)
         queued.assert_not_awaited()
 
+    def test_admin_keyboard_exposes_persistent_quiet_hours_toggle(self):
+        settings = {
+            "quiet_hours_enabled": "true",
+            "ozon_discount_filter": "true",
+            "publication_target": "main",
+        }
+        admin = SimpleNamespace(
+            state=SimpleNamespace(is_paused=False),
+            settings=SimpleNamespace(test_channel="test"),
+            db=SimpleNamespace(
+                get_setting=lambda key, default: settings.get(key, default),
+            ),
+        )
+
+        keyboard = AdminMixin.get_admin_keyboard(admin)
+        button = next(
+            button
+            for row in keyboard
+            for button in row
+            if button.type.data == b"toggle_quiet_hours"
+        )
+
+        self.assertIn("ВКЛ", button.text)
+
+    def test_admin_keyboard_exposes_wb_minimum_stock_toggle(self):
+        settings = {"wb_min_stock_filter": "true"}
+        admin = SimpleNamespace(
+            state=SimpleNamespace(is_paused=False),
+            settings=SimpleNamespace(test_channel=None),
+            db=SimpleNamespace(
+                get_setting=lambda key, default: settings.get(key, default),
+            ),
+        )
+
+        keyboard = AdminMixin.get_admin_keyboard(admin)
+        button = next(
+            button
+            for row in keyboard
+            for button in row
+            if button.type.data == b"toggle_wb_stock_filter"
+        )
+
+        self.assertIn("ВКЛ", button.text)
+
     async def test_wb_enrichment_rejects_below_three_and_accepts_three(self):
         class FakeMarketData:
             settings = SimpleNamespace(
@@ -181,6 +356,7 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             )
             state = SimpleNamespace(cards_parsed=0)
             quantity = 2
+            db = SimpleNamespace(get_setting=lambda key, default: "true")
 
             async def fetch_wb_card_data(self, *args, **kwargs):
                 return ProductCardData(
@@ -194,6 +370,27 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         fake.quantity = 3
         self.assertIsNotNone(await MarketDataMixin.enrich_product_with_card(fake, make_product()))
 
+    async def test_wb_minimum_stock_filter_can_be_disabled(self):
+        class FakeMarketData:
+            settings = SimpleNamespace(
+                require_sku=True,
+                skip_out_of_stock=True,
+                require_price=True,
+            )
+            state = SimpleNamespace(cards_parsed=0)
+            db = SimpleNamespace(get_setting=lambda key, default: "false")
+
+            async def fetch_wb_card_data(self, *args, **kwargs):
+                return ProductCardData(in_stock=True, total_quantity=2, price_byn=10)
+
+        enriched = await MarketDataMixin.enrich_product_with_card(
+            FakeMarketData(),
+            make_product(),
+        )
+
+        self.assertIsNotNone(enriched)
+        self.assertEqual(enriched.total_quantity, 2)
+
 
 class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -206,12 +403,18 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         os.unlink(self.db_path)
 
     def test_admin_settings_persist(self):
+        self.assertEqual(self.db.get_setting("wb_min_stock_filter", "true"), "true")
+        self.assertEqual(self.db.get_setting("quiet_hours_enabled", "true"), "true")
         self.db.set_setting("quiet_hours_start", "22:15")
         self.db.set_setting("quiet_hours_end", "06:45")
+        self.db.set_setting("quiet_hours_enabled", "false")
         self.db.set_setting("ozon_discount_filter", "false")
+        self.db.set_setting("wb_min_stock_filter", "false")
         self.assertEqual(self.db.get_setting("quiet_hours_start", "01:30"), "22:15")
         self.assertEqual(self.db.get_setting("quiet_hours_end", "07:00"), "06:45")
+        self.assertEqual(self.db.get_setting("quiet_hours_enabled", "true"), "false")
         self.assertEqual(self.db.get_setting("ozon_discount_filter", "true"), "false")
+        self.assertEqual(self.db.get_setting("wb_min_stock_filter", "true"), "false")
 
     async def test_old_published_post_table_is_migrated(self):
         self.db.close()
@@ -253,6 +456,7 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         migrated = self.db.get_due_published_posts(1900)
         self.assertEqual(migrated[0]["post_id"], "main:900")
         self.assertEqual(migrated[0]["target_channel"], "main")
+        self.assertEqual(migrated[0]["check_interval_seconds"], 3600)
 
     def test_scheduled_reservation_survives_pending_ttl(self):
         product = make_product()
@@ -271,6 +475,66 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         due = self.db.get_due_published_posts(1900)
         self.assertEqual(due[0]["message_ids"], "[44]")
         self.assertEqual(due[0]["discount_percent"], 60)
+        self.assertEqual(due[0]["check_interval_seconds"], 3600)
+
+    async def test_stock_check_interval_doubles_and_stops_before_auto_deletion(self):
+        product = make_product("Ozon", price_byn=40, avg_month_price_byn=100)
+        self.db.reserve_fresh([product], 1, 2)
+        self.db.save_published_post(product, "post", [44], 60, published_at=1000)
+        client = SimpleNamespace(edit_message=AsyncMock(), delete_messages=AsyncMock())
+        parser = SimpleNamespace(
+            user_client=client,
+            db=self.db,
+            record_admin_error=lambda message: None,
+        )
+        parser.get_channel_entity = AsyncMock(return_value="target")
+
+        for checked_at, expected_next_at, expected_interval in (
+            (1900, 5500, 2 * 3600),
+            (5500, 12700, 4 * 3600),
+            (12700, 27100, 8 * 3600),
+            (27100, 55900, 8 * 3600),
+            (55900, 84700, 8 * 3600),
+        ):
+            row = self.db.get_due_published_posts(checked_at)[0]
+            await PipelineMixin.handle_published_post_check(
+                parser,
+                row,
+                product,
+                ProductCardData(in_stock=True),
+                checked_at,
+            )
+            next_row = self.db.get_due_published_posts(expected_next_at)
+            self.assertEqual(next_row[0]["next_check_at"], expected_next_at)
+            self.assertEqual(next_row[0]["check_interval_seconds"], expected_interval)
+
+        row = self.db.get_due_published_posts(84700)[0]
+        await PipelineMixin.handle_published_post_check(
+            parser,
+            row,
+            product,
+            ProductCardData(in_stock=True),
+            84700,
+        )
+        status = self.db._conn.execute(
+            "SELECT status FROM published_posts WHERE post_id = ?",
+            ("main:44",),
+        ).fetchone()
+        self.assertEqual(status[0], "expired")
+        self.assertEqual(
+            self.db.get_due_published_posts(100000),
+            [],
+        )
+
+    def test_auto_deleted_posts_are_removed_from_check_schedule(self):
+        product = make_product()
+        self.db.reserve_fresh([product], 1, 2)
+        self.db.save_published_post(product, "post", [47], None, published_at=1000)
+
+        expired = self.db.expire_old_published_posts(1000 + 24 * 3600)
+
+        self.assertEqual(expired, 1)
+        self.assertEqual(self.db.get_due_published_posts(1000 + 24 * 3600), [])
 
     def test_multiple_posts_for_same_sku_keep_independent_message_tracking(self):
         product = make_product()
@@ -301,6 +565,8 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.db.set_setting("quiet_hours_end", "06:00")
         overnight = datetime(2026, 11, 1, 23, 0, tzinfo=ZoneInfo("Europe/Minsk")).timestamp()
         self.assertEqual(PipelineMixin.quiet_period_remaining(parser, overnight), 7 * 3600)
+        self.db.set_setting("quiet_hours_enabled", "false")
+        self.assertEqual(PipelineMixin.quiet_period_remaining(parser, overnight), 0)
 
     async def test_unavailable_check_error_does_not_change_post(self):
         product = make_product("Ozon", sku="oz-1")
@@ -325,8 +591,9 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unavailable_high_discount_post_is_marked(self):
         product = make_product("Ozon", sku="oz-high")
+        publication_text = f"🔷 Ozon\n\n🔗 {product.canonical_url}"
         self.db.reserve_fresh([product], 1, 2)
-        self.db.save_published_post(product, "post body", [44, 45], 55, published_at=1000)
+        self.db.save_published_post(product, publication_text, [44, 45], 55, published_at=1000)
         row = self.db.get_due_published_posts(1900)[0]
         client = SimpleNamespace(edit_message=AsyncMock(), delete_messages=AsyncMock())
         parser = SimpleNamespace(
@@ -346,6 +613,19 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         client.edit_message.assert_awaited_once()
+        edit_call = client.edit_message.await_args
+        edited_text = edit_call.args[2]
+        self.assertTrue(edited_text.endswith("❌ Неактуально"))
+        url_offset = publication_text.index(product.canonical_url)
+        expected_offset = len(publication_text[:url_offset].encode("utf-16-le")) // 2
+        expected_length = len(product.canonical_url.encode("utf-16-le")) // 2
+        self.assertEqual(
+            edit_call.kwargs["formatting_entities"],
+            [
+                MessageEntityUrl(offset=expected_offset, length=expected_length),
+                MessageEntityStrike(offset=expected_offset, length=expected_length),
+            ],
+        )
         client.delete_messages.assert_awaited_once_with("target", [45])
         status = self.db._conn.execute(
             "SELECT status FROM published_posts WHERE post_id = ?",

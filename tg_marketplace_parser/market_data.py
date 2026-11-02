@@ -25,13 +25,14 @@ from .common import (
     build_storefront_url,
     clean_product_title,
     convert_image_bytes_to_jpeg,
-    has_product_sku,
+    has_expanded_product_url,
     is_antibot_redirect_loop,
     is_non_product_url,
     is_ozon_host,
     log,
     normalize_host,
     normalize_image_url,
+    ozon_product_path,
     strip_antibot_params,
     validate_marketplace_url,
 )
@@ -752,10 +753,11 @@ class MarketDataMixin:
         sku: str,
         original_url: str = "",
         messages: Iterable = (),
+        canonical_url: str = "",
     ) -> ProductCardData | None:
         """Парсит карточку товара Ozon: красивое название, актуальная цена в BYN, средняя цена за месяц, главное фото и наличие."""
         rub_rate = await self.get_rub_to_byn_rate()
-        product_path = f"/product/{sku}/"
+        product_path = ozon_product_path(sku, canonical_url)
         encoded_path = quote(product_path, safe="/")
 
         card_data: ProductCardData | None = None
@@ -833,6 +835,7 @@ class MarketDataMixin:
             browser_card, fresh_cookies = await self.browser_resolver.fetch_product_card(
                 sku,
                 rub_to_byn_rate=rub_rate,
+                canonical_url=canonical_url,
             )
             if fresh_cookies:
                 self._sync_cookies_to_http_clients(fresh_cookies)
@@ -849,7 +852,11 @@ class MarketDataMixin:
         ):
             for host in storefronts[:2]:
                 default_curr = "BYN" if host == "ozon.by" else "RUB"
-                page_url = f"https://{host}/product/{sku}/" if host == "ozon.by" else f"https://www.{host}/product/{sku}/"
+                page_url = (
+                    f"https://{host}{product_path}"
+                    if host == "ozon.by"
+                    else f"https://www.{host}{product_path}"
+                )
                 with suppress(Exception):
                     async with self.resolve_semaphore:
                         resp = await self.curl_session.get(
@@ -880,7 +887,7 @@ class MarketDataMixin:
         ):
             for host in ("ozon.by", "www.ozon.ru"):
                 default_curr = "BYN" if "ozon.by" in host else "RUB"
-                target_url = f"https://{host}/product/{sku}/"
+                target_url = f"https://{host}{product_path}"
                 with suppress(Exception):
                     res = await self.user_client(GetWebPageRequest(url=target_url, hash=0))
                     webpage = getattr(res, "webpage", res)
@@ -929,6 +936,7 @@ class MarketDataMixin:
                 product.sku,
                 original_url=product.original_url,
                 messages=messages,
+                canonical_url=product.canonical_url,
             )
 
         if card is not None:
@@ -942,6 +950,7 @@ class MarketDataMixin:
         if (
             card is not None
             and product.platform == "Wildberries"
+            and self.db.get_setting("wb_min_stock_filter", "true") == "true"
             and card.total_quantity is not None
             and card.total_quantity < 3
         ):
@@ -1018,7 +1027,7 @@ class MarketDataMixin:
 
                     if location and 300 <= status < 400:
                         next_url = urljoin(current_url, location)
-                        if has_product_sku(next_url):
+                        if has_expanded_product_url(next_url):
                             log(f"Ссылка раскрыта через curl_cffi ({domain}): {clean_url} -> {next_url}")
                             return next_url
 
@@ -1031,7 +1040,7 @@ class MarketDataMixin:
 
                     content = resp.content[:HEAD_READ_LIMIT] if resp.content else b""
                     upgraded = self._extract_sku_from_html(content, str(resp.url or current_url))
-                    if upgraded and has_product_sku(upgraded):
+                    if upgraded and has_expanded_product_url(upgraded):
                         log(f"Артикул извлечён через curl_cffi HTML ({domain}): {clean_url} -> {upgraded}")
                         return upgraded
                     break
@@ -1075,7 +1084,7 @@ class MarketDataMixin:
                             allow_redirects=True,
                             max_redirects=4,
                         )
-                        if has_product_sku(str(resp.url)):
+                        if has_expanded_product_url(str(resp.url)):
                             return str(resp.url)
                         upgraded = self._extract_sku_from_html(resp.content[:HEAD_READ_LIMIT], clean_url)
                         if upgraded:
@@ -1092,7 +1101,7 @@ class MarketDataMixin:
                         headers=OZON_APP_HEADERS,
                     ) as response:
                         final_url = str(response.url)
-                        if has_product_sku(final_url):
+                        if has_expanded_product_url(final_url):
                             return final_url
                         raw = await response.content.read(HEAD_READ_LIMIT)
             except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -1150,7 +1159,7 @@ class MarketDataMixin:
 
     async def upgrade_to_product_url(self, url: str, prefetched_body: bytes | None = None) -> str:
         """Если в URL нет артикула (например, ozon.ru/p/oXXXX), ищем его через каскад обхода антибота."""
-        if has_product_sku(url):
+        if has_expanded_product_url(url):
             return url
 
         clean_url = strip_antibot_params(url)
@@ -1165,7 +1174,7 @@ class MarketDataMixin:
                 return upgraded
 
         via_tg = await self._resolve_via_telegram_webpage(clean_url)
-        if via_tg and has_product_sku(via_tg):
+        if via_tg and has_expanded_product_url(via_tg):
             self.state.http_resolved += 1
             return via_tg
 
@@ -1173,17 +1182,17 @@ class MarketDataMixin:
             via_browser, fresh_cookies = await self.browser_resolver.resolve_short_url(clean_url)
             if fresh_cookies:
                 self._sync_cookies_to_http_clients(fresh_cookies)
-            if via_browser and has_product_sku(via_browser):
+            if via_browser and has_expanded_product_url(via_browser):
                 self.state.browser_resolved += 1
                 return via_browser
 
         via_curl = await self._resolve_via_curl_cffi(clean_url)
-        if via_curl and has_product_sku(via_curl):
+        if via_curl and has_expanded_product_url(via_curl):
             self.state.http_resolved += 1
             return via_curl
 
         via_api = await self._resolve_via_ozon_mobile_api(clean_url)
-        if via_api and has_product_sku(via_api):
+        if via_api and has_expanded_product_url(via_api):
             self.state.http_resolved += 1
             return via_api
 
@@ -1255,7 +1264,7 @@ class MarketDataMixin:
         if not validate_marketplace_url(url):
             return None
 
-        if has_product_sku(url):
+        if has_expanded_product_url(url):
             return url
 
         if is_non_product_url(url):
@@ -1271,7 +1280,7 @@ class MarketDataMixin:
         ):
             if self.curl_session is not None:
                 via_curl = await self._resolve_via_curl_cffi(clean_initial_url)
-                if via_curl and has_product_sku(via_curl):
+                if via_curl and has_expanded_product_url(via_curl):
                     self.state.http_resolved += 1
                     return via_curl
 
@@ -1287,7 +1296,7 @@ class MarketDataMixin:
                 log(f"Отклонён небезопасный URL/редирект: {current_url}", logging.WARNING)
                 return None
 
-            if has_product_sku(current_url):
+            if has_expanded_product_url(current_url):
                 log(f"Артикул найден в URL на шаге {step}: {current_url}")
                 self.state.http_resolved += 1
                 return current_url
@@ -1306,7 +1315,7 @@ class MarketDataMixin:
 
             if location and 300 <= status < 400:
                 next_url = urljoin(current_url, location)
-                if has_product_sku(next_url):
+                if has_expanded_product_url(next_url):
                     log(f"Редирект {step}/{max_redirects}: {status} {current_url} -> {next_url}")
                     self.state.http_resolved += 1
                     return next_url
@@ -1330,4 +1339,12 @@ class MarketDataMixin:
             log(f"Конец цепочки: HTTP {status}, ozon-antibot={antibot}, {current_url}")
             break
 
-        return await self.upgrade_to_product_url(clean_initial_url, prefetched_body=last_body)
+        resolved_url = await self.upgrade_to_product_url(clean_initial_url, prefetched_body=last_body)
+        if has_expanded_product_url(resolved_url):
+            return resolved_url
+        log(
+            f"Ссылка Ozon не раскрыта до полного URL товара, публикация пропущена: "
+            f"{clean_initial_url}",
+            logging.WARNING,
+        )
+        return None

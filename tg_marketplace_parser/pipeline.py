@@ -5,18 +5,23 @@ import logging
 from dataclasses import replace
 from datetime import datetime, time as datetime_time, timedelta
 from telethon.errors import FloodWaitError
-from telethon.tl.types import MessageMediaWebPage
+from telethon.tl.types import MessageEntityStrike, MessageEntityUrl, MessageMediaWebPage
 import time
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from .common import (
-    has_product_sku,
+    has_expanded_product_url,
     is_ozon_host,
     log,
     normalize_host,
     validate_marketplace_url,
 )
-from .constants import MAX_FLOOD_RETRIES
+from .constants import (
+    INITIAL_STOCK_CHECK_INTERVAL_SECONDS,
+    MAX_FLOOD_RETRIES,
+    MAX_POST_CHECK_INTERVAL_SECONDS,
+    POST_AUTO_DELETE_SECONDS,
+)
 from .message_parsing import (
     extract_links,
     extract_skus_from_text,
@@ -89,6 +94,8 @@ class PipelineMixin:
         task.add_done_callback(self.retry_tasks.discard)
 
     def quiet_period_remaining(self, timestamp: float | None = None) -> int:
+        if self.db.get_setting("quiet_hours_enabled", "true") != "true":
+            return 0
         now = datetime.fromtimestamp(
             time.time() if timestamp is None else timestamp,
             ZoneInfo(self.settings.timezone),
@@ -118,6 +125,7 @@ class PipelineMixin:
             product.sku or "",
             original_url=product.original_url,
             messages=messages,
+            canonical_url=product.canonical_url,
         )
 
     def ozon_discount_filter_enabled(self) -> bool:
@@ -196,11 +204,22 @@ class PipelineMixin:
                 if not message_ids:
                     raise RuntimeError("в базе отсутствуют ID сообщения для товара")
                 if (row["discount_percent"] or 0) > 50:
+                    publication_text = row["publication_text"]
+                    link_offset = publication_text.find(product.canonical_url)
+                    formatting_entities = []
+                    if link_offset >= 0:
+                        offset = len(publication_text[:link_offset].encode("utf-16-le")) // 2
+                        length = len(product.canonical_url.encode("utf-16-le")) // 2
+                        formatting_entities = [
+                            MessageEntityUrl(offset=offset, length=length),
+                            MessageEntityStrike(offset=offset, length=length),
+                        ]
                     await self.user_client.edit_message(
                         target_entity,
                         message_ids[0],
-                        row["publication_text"] + "\n\n❌ Неактуально",
+                        publication_text + "\n\n❌ Неактуально",
                         parse_mode=None,
+                        formatting_entities=formatting_entities,
                     )
                     if len(message_ids) > 1:
                         await self.user_client.delete_messages(target_entity, message_ids[1:])
@@ -211,8 +230,19 @@ class PipelineMixin:
                     self.db.set_published_post_status(row["post_id"], "deleted")
                     log(f"Пост {product.platform} {product.sku} удалён: товара нет в наличии")
             else:
-                delay = 3600 if card is not None and card.in_stock is True else 15 * 60
-                self.db.defer_published_post_check(row["post_id"], now + delay)
+                if card is not None and card.in_stock is True:
+                    interval = row.get(
+                        "check_interval_seconds",
+                        INITIAL_STOCK_CHECK_INTERVAL_SECONDS,
+                    )
+                    self.db.schedule_next_published_post_check(
+                        row["post_id"],
+                        now + interval,
+                        min(interval * 2, MAX_POST_CHECK_INTERVAL_SECONDS),
+                        row["published_at"] + POST_AUTO_DELETE_SECONDS,
+                    )
+                else:
+                    self.db.defer_published_post_check(row["post_id"], now + 15 * 60)
                 if card is None:
                     log(
                         f"Проверка наличия {product.platform} {product.sku} не дала результата; "
@@ -243,6 +273,7 @@ class PipelineMixin:
                 raise RuntimeError("наличие товара не подтверждено")
             if (
                 product.platform == "Wildberries"
+                and self.db.get_setting("wb_min_stock_filter", "true") == "true"
                 and card.total_quantity is not None
                 and card.total_quantity < 3
             ):
@@ -362,6 +393,9 @@ class PipelineMixin:
                         await asyncio.sleep(1)
                         continue
 
+            expired_posts = self.db.expire_old_published_posts(now)
+            if expired_posts:
+                log(f"Мониторинг завершён для {expired_posts} постов старше суток")
             due_posts = self.db.get_due_published_posts(now, limit=20)
             due_wb_posts = [
                 row for row in due_posts
@@ -438,12 +472,12 @@ class PipelineMixin:
         urls_to_resolve: list[tuple[int, str]] = []
 
         for idx, original_url in enumerate(candidate_links):
-            if has_product_sku(original_url):
+            if has_expanded_product_url(original_url):
                 pre_resolved[idx] = original_url
                 continue
 
             preview_url = match_message_preview_url(job.messages, original_url, len(candidate_links))
-            if preview_url and has_product_sku(preview_url):
+            if preview_url and has_expanded_product_url(preview_url):
                 log(f"Используем URL из Telegram-превью без сетевого запроса для {original_url}: {preview_url}")
                 pre_resolved[idx] = preview_url
                 continue
@@ -499,8 +533,17 @@ class PipelineMixin:
                 )
                 continue
 
-            if validate_marketplace_url(product.canonical_url):
+            if (
+                validate_marketplace_url(product.canonical_url)
+                and has_expanded_product_url(product.canonical_url)
+            ):
                 products.append(product)
+            else:
+                log(
+                    f"Товар пропущен: не удалось получить раскрытый URL товара: "
+                    f"{original_url} -> {product.canonical_url}",
+                    logging.WARNING,
+                )
 
         if not products:
             self.state.rejected += 1

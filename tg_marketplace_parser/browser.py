@@ -16,10 +16,11 @@ from urllib.parse import (
 from .common import (
     build_storefront_url,
     clean_product_title,
-    has_product_sku,
+    has_expanded_product_url,
     is_ozon_host,
     log,
     normalize_image_url,
+    ozon_product_path,
 )
 from .config import Settings
 from .constants import (
@@ -335,12 +336,12 @@ class OzonBrowserResolver:
             )
             if isinstance(payload, dict):
                 direct_url = payload.get("url") or ""
-                if direct_url and has_product_sku(direct_url):
+                if direct_url and has_expanded_product_url(direct_url):
                     return direct_url
                 body = payload.get("body") or ""
                 if body:
                     extracted = extract_product_url_from_text(body, page.url or base_url)
-                    if extracted and has_product_sku(extracted):
+                    if extracted and has_expanded_product_url(extracted):
                         return extracted
                 debug_info = payload.get("debug")
                 if debug_info:
@@ -352,6 +353,7 @@ class OzonBrowserResolver:
         sku: str,
         *,
         rub_to_byn_rate: float = 0.0345,
+        canonical_url: str = "",
     ) -> tuple[ProductCardData | None, list[dict]]:
         """Получает данные карточки товара Ozon (название, цена в BYN, средняя цена за месяц, главное фото, наличие) через браузер.
 
@@ -377,7 +379,7 @@ class OzonBrowserResolver:
                 if domain not in storefronts:
                     storefronts.append(domain)
 
-            product_path = f"/product/{sku}/"
+            product_path = ozon_product_path(sku, canonical_url)
             encoded_path = quote(product_path, safe="/")
 
             for domain in storefronts:
@@ -653,7 +655,11 @@ class OzonBrowserResolver:
 
                 nav_page.on("response", lambda r: asyncio.create_task(_handle_ozon_response(r)))
 
-                target_url = f"https://{domain}/product/{sku}/" if domain == "ozon.by" else f"https://www.{domain}/product/{sku}/"
+                target_url = (
+                    f"https://{domain}{product_path}"
+                    if domain == "ozon.by"
+                    else f"https://www.{domain}{product_path}"
+                )
                 try:
                     resp = await nav_page.goto(target_url, wait_until="domcontentloaded", timeout=11_000)
                     if resp and resp.status == 404:
@@ -1299,7 +1305,7 @@ class OzonBrowserResolver:
                 warm_page = await self._warm_up_storefront(domain)
                 if warm_page is not None:
                     via_inpage = await self._fetch_via_inpage_api(warm_page, short_path, clean_url)
-                    if via_inpage and has_product_sku(via_inpage):
+                    if via_inpage and has_expanded_product_url(via_inpage):
                         cookies = await self._export_cookies()
                         log(f"Ссылка раскрыта через прогретый браузер ({domain} in-page): {clean_url} -> {via_inpage}")
                         return via_inpage, cookies
@@ -1310,7 +1316,7 @@ class OzonBrowserResolver:
                 loop_aborted = False
 
                 def _on_url_candidate(candidate_url: str) -> None:
-                    if candidate_url and has_product_sku(candidate_url):
+                    if candidate_url and has_expanded_product_url(candidate_url):
                         captured_urls.append(candidate_url)
 
                 def _handle_request(req) -> None:
@@ -1330,9 +1336,9 @@ class OzonBrowserResolver:
                 async def _route_handler(route) -> None:
                     nonlocal loop_aborted
                     req_url = route.request.url
-                    if has_product_sku(req_url):
+                    if has_expanded_product_url(req_url):
                         captured_urls.append(req_url)
-                    if "__rr=" in req_url and not has_product_sku(req_url):
+                    if "__rr=" in req_url and not has_expanded_product_url(req_url):
                         qs = parse_qs(urlparse(req_url).query)
                         try:
                             rr_val = int(qs.get("__rr", ["0"])[0])
@@ -1373,12 +1379,12 @@ class OzonBrowserResolver:
                             log(f"Навигация {target_url}: {type(exc).__name__}: {str(exc)[:120]}", logging.DEBUG)
 
                         for candidate in reversed(captured_urls):
-                            if has_product_sku(candidate):
+                            if has_expanded_product_url(candidate):
                                 cookies = await self._export_cookies()
                                 log(f"Ссылка раскрыта через браузер ({domain}): {clean_url} -> {candidate}")
                                 return candidate, cookies
 
-                        if has_product_sku(nav_page.url):
+                        if has_expanded_product_url(nav_page.url):
                             cookies = await self._export_cookies()
                             log(f"Ссылка раскрыта через браузер ({domain}): {clean_url} -> {nav_page.url}")
                             return nav_page.url, cookies
@@ -1395,11 +1401,11 @@ class OzonBrowserResolver:
                         deadline = time.monotonic() + min(8, self.settings.browser_challenge_timeout)
                         while time.monotonic() < deadline:
                             for candidate in reversed(captured_urls):
-                                if has_product_sku(candidate):
+                                if has_expanded_product_url(candidate):
                                     cookies = await self._export_cookies()
                                     log(f"Ссылка раскрыта через браузер ({domain}): {clean_url} -> {candidate}")
                                     return candidate, cookies
-                            if has_product_sku(nav_page.url):
+                            if has_expanded_product_url(nav_page.url):
                                 cookies = await self._export_cookies()
                                 log(f"Ссылка раскрыта через браузер ({domain}): {clean_url} -> {nav_page.url}")
                                 return nav_page.url, cookies
@@ -1411,7 +1417,7 @@ class OzonBrowserResolver:
                             title = (await nav_page.title()).strip()
                             html_body = await nav_page.content()
                             extracted = extract_product_url_from_text(html_body, target_url)
-                            if extracted and has_product_sku(extracted):
+                            if extracted and has_expanded_product_url(extracted):
                                 cookies = await self._export_cookies()
                                 log(f"Ссылка извлечена из DOM браузера ({domain}): {clean_url} -> {extracted}")
                                 return extracted, cookies

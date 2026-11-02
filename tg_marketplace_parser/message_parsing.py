@@ -9,7 +9,7 @@ from urllib.parse import (
 from .common import (
     extract_wb_sku,
     get_short_code,
-    has_product_sku,
+    has_expanded_product_url,
     is_wb_host,
     normalize_host,
     validate_marketplace_url,
@@ -54,11 +54,11 @@ def extract_product_url_from_text(raw_text: str, base_url: str) -> str | None:
         if path_match:
             candidate_path = path_match.group(1).strip("\"'<>\\")
             if candidate_path.startswith(("http://", "https://")):
-                if has_product_sku(candidate_path):
+                if has_expanded_product_url(candidate_path):
                     return candidate_path
             else:
                 full = f"https://www.{canonical_host}{candidate_path}"
-                if has_product_sku(full):
+                if has_expanded_product_url(full):
                     return full
 
         head_part = variant.split("</head>", 1)[0]
@@ -89,7 +89,7 @@ def extract_url_from_webpage_obj(webpage, base_url: str) -> str | None:
         if not candidate or not isinstance(candidate, str):
             continue
         full = candidate if candidate.startswith(("http://", "https://")) else "https://" + candidate.lstrip("/")
-        if validate_marketplace_url(full) and has_product_sku(full):
+        if validate_marketplace_url(full) and has_expanded_product_url(full):
             return full
 
     for attr in ("url", "display_url", "title", "description"):

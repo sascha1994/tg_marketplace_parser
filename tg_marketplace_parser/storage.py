@@ -5,6 +5,11 @@ from dataclasses import asdict
 from contextlib import suppress
 from typing import Iterable
 
+from .constants import (
+    INITIAL_POST_CHECK_INTERVAL_SECONDS,
+    INITIAL_STOCK_CHECK_INTERVAL_SECONDS,
+    POST_AUTO_DELETE_SECONDS,
+)
 from .models import ProductInfo
 
 class DuplicateDB:
@@ -74,6 +79,7 @@ class DuplicateDB:
                 message_ids TEXT NOT NULL,
                 published_at INTEGER NOT NULL,
                 next_check_at INTEGER NOT NULL,
+                check_interval_seconds INTEGER NOT NULL DEFAULT 3600,
                 discount_percent REAL,
                 target_channel TEXT NOT NULL DEFAULT 'main',
                 status TEXT NOT NULL DEFAULT 'active'
@@ -111,6 +117,7 @@ class DuplicateDB:
                     message_ids TEXT NOT NULL,
                     published_at INTEGER NOT NULL,
                     next_check_at INTEGER NOT NULL,
+                    check_interval_seconds INTEGER NOT NULL DEFAULT 3600,
                     discount_percent REAL,
                     target_channel TEXT NOT NULL DEFAULT 'main',
                     status TEXT NOT NULL DEFAULT 'active'
@@ -175,6 +182,15 @@ class DuplicateDB:
             self._conn.execute(
                 "ALTER TABLE published_posts ADD COLUMN target_channel "
                 "TEXT NOT NULL DEFAULT 'main'"
+            )
+
+        published_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(published_posts)")
+        }
+        if "check_interval_seconds" not in published_columns:
+            self._conn.execute(
+                "ALTER TABLE published_posts ADD COLUMN check_interval_seconds "
+                f"INTEGER NOT NULL DEFAULT {INITIAL_STOCK_CHECK_INTERVAL_SECONDS}"
             )
 
     def reserve_fresh(
@@ -342,8 +358,8 @@ class DuplicateDB:
                 """
                 INSERT INTO published_posts(
                     post_id, sku_key, product_json, publication_text, message_ids, published_at,
-                    next_check_at, discount_percent, target_channel, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                    next_check_at, check_interval_seconds, discount_percent, target_channel, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
                 """,
                 (
                     f"{target_channel}:{message_id_list[0]}",
@@ -352,7 +368,8 @@ class DuplicateDB:
                     publication_text,
                     json.dumps(message_id_list),
                     published_at,
-                    published_at + 15 * 60,
+                    published_at + INITIAL_POST_CHECK_INTERVAL_SECONDS,
+                    INITIAL_STOCK_CHECK_INTERVAL_SECONDS,
                     discount_percent,
                     target_channel,
                 ),
@@ -374,7 +391,7 @@ class DuplicateDB:
     def get_due_published_posts(self, now: int, limit: int = 1) -> list[dict]:
         rows = self._conn.execute(
             "SELECT post_id, sku_key, product_json, publication_text, message_ids, published_at, "
-            "next_check_at, discount_percent, target_channel FROM published_posts "
+            "next_check_at, check_interval_seconds, discount_percent, target_channel FROM published_posts "
             "WHERE status = 'active' AND next_check_at <= ? "
             "ORDER BY next_check_at LIMIT ?",
             (now, limit),
@@ -388,8 +405,9 @@ class DuplicateDB:
                 "message_ids": row[4],
                 "published_at": row[5],
                 "next_check_at": row[6],
-                "discount_percent": row[7],
-                "target_channel": row[8],
+                "check_interval_seconds": row[7],
+                "discount_percent": row[8],
+                "target_channel": row[9],
             }
             for row in rows
         ]
@@ -405,6 +423,34 @@ class DuplicateDB:
             "UPDATE published_posts SET next_check_at = ? WHERE post_id = ? AND status = 'active'",
             (next_check_at, post_id),
         )
+
+    def schedule_next_published_post_check(
+        self,
+        post_id: str,
+        next_check_at: int,
+        next_interval_seconds: int,
+        expires_at: int,
+    ) -> None:
+        if next_check_at >= expires_at:
+            self._conn.execute(
+                "UPDATE published_posts SET status = 'expired' "
+                "WHERE post_id = ? AND status = 'active'",
+                (post_id,),
+            )
+            return
+        self._conn.execute(
+            "UPDATE published_posts SET next_check_at = ?, check_interval_seconds = ? "
+            "WHERE post_id = ? AND status = 'active'",
+            (next_check_at, next_interval_seconds, post_id),
+        )
+
+    def expire_old_published_posts(self, now: int) -> int:
+        cursor = self._conn.execute(
+            "UPDATE published_posts SET status = 'expired' "
+            "WHERE status = 'active' AND published_at <= ?",
+            (now - POST_AUTO_DELETE_SECONDS,),
+        )
+        return cursor.rowcount
 
     def release_reservations(self, sku_keys: Iterable[str]) -> None:
         keys = tuple(set(sku_keys))

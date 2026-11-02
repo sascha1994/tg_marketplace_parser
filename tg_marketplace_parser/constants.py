@@ -98,6 +98,10 @@ MAX_FLOOD_RETRIES = 3
 HTTP_RETRY_ATTEMPTS = 3
 HEAD_READ_LIMIT = 450_000
 IMAGE_READ_LIMIT = 8_000_000
+INITIAL_POST_CHECK_INTERVAL_SECONDS = 15 * 60
+INITIAL_STOCK_CHECK_INTERVAL_SECONDS = 60 * 60
+MAX_POST_CHECK_INTERVAL_SECONDS = 8 * 60 * 60
+POST_AUTO_DELETE_SECONDS = 24 * 60 * 60
 
 URL_RE = re.compile(r"https?://[^\s<>\[\]\(\)\"']+", re.IGNORECASE)
 
@@ -116,15 +120,23 @@ WB_BASKET_HOST_IN_URL_RE = re.compile(
 # Глобальный кэш соответствия vol -> basket-XX.wbbasket.ru (обновляется динамически при пробинге и из браузера)
 WB_BASKET_VOL_CACHE: dict[int, str] = {}
 
-# Поддержка любых поддоменов ozon.(ru|by|kz), путей /product/...-<sku> и /context/detail/id/<sku>
-OZON_SKU_RE = re.compile(
+# Поддержка артикулов Ozon и идентификаторов карточек /p/o<id>
+OZON_FULL_SKU_RE = re.compile(
     r"(?:[a-z0-9-]+\.)?ozon\.(?:ru|by|kz)/(?:product/(?:[^/?#\"'\s<>\\]*-)?|context/detail/id/)(\d{5,15})(?:[/?#\"'\s<>\\]|$)",
     re.IGNORECASE,
 )
+OZON_SKU_RE = re.compile(
+    r"(?:[a-z0-9-]+\.)?ozon\.(?:ru|by|kz)/(?:product/(?:[^/?#\"'\s<>\\]*-)?|context/detail/id/)(\d{5,15})(?:[/?#\"'\s<>\\]|$)|"
+    r"(?:[a-z0-9-]+\.)?ozon\.(?:ru|by|kz)/p/(o\d{5,15})(?:[/?#\"'\s<>\\]|$)",
+    re.IGNORECASE,
+)
+OZON_SHORT_PRODUCT_ID_RE = re.compile(r"o\d{5,15}", re.IGNORECASE)
 
 # Поиск полного пути /product/<slug>-<sku>/ в теле ответа/JSON
 OZON_PRODUCT_PATH_RE = re.compile(
-    r"((?:https?://(?:[a-z0-9-]+\.)?ozon\.(?:ru|by|kz))?/(?:product/(?:[^/?#\"'\s<>\\]+-)?|context/detail/id/)(\d{5,15})(?:/|\b)[^\s\"'<>\\]*)",
+    r"((?:https?://(?:[a-z0-9-]+\.)?ozon\.(?:ru|by|kz))?/"
+    r"(?:product/(?:[^/?#\"'\s<>\\]+-)?\d{5,15}|context/detail/id/\d{5,15})"
+    r"(?:/|\b)[^\s\"'<>\\]*)",
     re.IGNORECASE,
 )
 

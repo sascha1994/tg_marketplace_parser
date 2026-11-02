@@ -6,12 +6,17 @@ from tg_marketplace_parser.presentation import build_publication_text
 
 class PublicationStoreBadgeTests(unittest.TestCase):
     def product(self, platform: str, sku: str) -> ProductInfo:
+        canonical_url = (
+            f"https://ozon.by/product/{int(sku) + 1_440_302_046}/"
+            if platform == "Ozon"
+            else f"https://www.wildberries.by/catalog/{int(sku) + 123_456}/detail.aspx"
+        )
         return ProductInfo(
-            original_url=f"https://example.test/{sku}",
-            resolved_url=f"https://example.test/{sku}",
+            original_url=canonical_url,
+            resolved_url=canonical_url,
             platform=platform,
             sku=sku,
-            canonical_url=f"https://example.test/{sku}",
+            canonical_url=canonical_url,
             sku_key=f"{platform}:{sku}",
             title=f"Товар {sku}",
         )

@@ -5,6 +5,7 @@ from urllib.parse import (
 )
 from .common import (
     extract_wb_sku,
+    has_expanded_product_url,
     is_ozon_host,
     is_wb_host,
     normalize_host,
@@ -12,6 +13,7 @@ from .common import (
 )
 from .constants import (
     OZON_SKU_RE,
+    OZON_SHORT_PRODUCT_ID_RE,
     URL_RE,
 )
 from .marketplace_parsing import get_wb_card_image_url
@@ -38,17 +40,22 @@ def parse_product_info(
 
     ozon_match = OZON_SKU_RE.search(resolved_url)
     if ozon_match:
-        sku = ozon_match.group(1)
+        sku = next(group for group in ozon_match.groups() if group)
         orig_host = normalize_host(urlparse(original_url).hostname)
         base_host = orig_host if is_ozon_host(orig_host) else urlparse(resolved_url).hostname
         canonical_host = resolve_ozon_canonical_host(base_host, canonical_host_override)
+        is_short_product_id = bool(OZON_SHORT_PRODUCT_ID_RE.fullmatch(sku))
         return ProductInfo(
             original_url=original_url,
             resolved_url=resolved_url,
             platform="Ozon",
             sku=sku,
-            canonical_url=f"https://{canonical_host}/product/{sku}/",
-            sku_key=f"ozon:{sku}",
+            canonical_url=(
+                f"https://{canonical_host}/p/{sku}"
+                if is_short_product_id
+                else f"https://{canonical_host}/product/{sku}/"
+            ),
+            sku_key=f"ozon:{'short:' if is_short_product_id else ''}{sku}",
         )
 
     parsed = urlparse(resolved_url)
@@ -111,6 +118,7 @@ def build_publication_text(
     include_source_notes: bool = False,
 ) -> str:
     """Формирует читаемый текст поста с разрывами между блоками на основе данных карточки товара."""
+    products = [product for product in products if has_expanded_product_url(product.canonical_url)]
     if not products:
         return ""
 

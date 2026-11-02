@@ -32,7 +32,9 @@ class AdminMixin:
         )
         quiet_start = self.db.get_setting("quiet_hours_start", "01:30")
         quiet_end = self.db.get_setting("quiet_hours_end", "07:00")
+        quiet_hours_enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
         discount_filter = self.db.get_setting("ozon_discount_filter", "true") == "true"
+        wb_stock_filter = self.db.get_setting("wb_min_stock_filter", "true") == "true"
         selected_target = self.db.get_setting("publication_target", "main")
         target_label = "тестовый" if selected_target == "test" else "основной"
         return (
@@ -43,8 +45,10 @@ class AdminMixin:
             f"Источников: {len(self.current_sources)}\n"
             f"Канал публикаций: {target_label}\n"
             f"Тестовый канал: {'настроен' if self.settings.test_channel else 'не настроен'}\n"
+            f"Ограничение по времени: {'включено' if quiet_hours_enabled else 'выключено'}\n"
             f"Перерыв публикаций: {quiet_start}–{quiet_end} ({self.settings.timezone})\n"
             f"Фильтр скидки Ozon ≥30%: {'включён' if discount_filter else 'выключен'}\n"
+            f"Фильтр остатков WB ≥3: {'включён' if wb_stock_filter else 'выключен'}\n"
             f"Аптайм: {hours}ч {minutes}м {seconds}с\n\n"
             f"🛡 Антибот и карточки:\n"
             f"• Браузер (Playwright): {browser_state}\n"
@@ -74,6 +78,16 @@ class AdminMixin:
             if self.db.get_setting("ozon_discount_filter", "true") == "true"
             else "⏸ Фильтр Ozon ≥30%: ВЫКЛ"
         )
+        quiet_hours_label = (
+            "✅ Перерыв по времени: ВКЛ"
+            if self.db.get_setting("quiet_hours_enabled", "true") == "true"
+            else "⏸ Перерыв по времени: ВЫКЛ"
+        )
+        wb_stock_filter_label = (
+            "✅ Остаток WB ≥3: ВКЛ"
+            if self.db.get_setting("wb_min_stock_filter", "true") == "true"
+            else "⏸ Остаток WB ≥3: ВЫКЛ"
+        )
         selected_target = self.db.get_setting("publication_target", "main")
         target_buttons = [
             Button.inline(
@@ -91,8 +105,10 @@ class AdminMixin:
         return [
             [Button.inline("📊 Обновить статус", b"refresh"), pause_button],
             target_buttons,
-            [Button.inline("⏰ Настроить перерыв", b"edit_schedule")],
+            [Button.inline(quiet_hours_label, b"toggle_quiet_hours")],
+            [Button.inline("⏰ Настроить интервал перерыва", b"edit_schedule")],
             [Button.inline(discount_label, b"toggle_ozon_discount")],
+            [Button.inline(wb_stock_filter_label, b"toggle_wb_stock_filter")],
             [Button.inline("📜 Последняя обработка", b"recent_jobs")],
             [Button.inline("⚠️ Последние ошибки", b"recent_errors")],
             [Button.inline("🔄 Обновить источники", b"reload_sources")],
@@ -232,11 +248,25 @@ class AdminMixin:
                     buttons=[[Button.inline("↩️ В панель", b"refresh")]],
                 )
                 await event.answer()
+            elif data == b"toggle_quiet_hours":
+                enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
+                self.db.set_setting("quiet_hours_enabled", "false" if enabled else "true")
+                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.answer(
+                    "Ограничение по времени включено"
+                    if not enabled
+                    else "Ограничение по времени отключено"
+                )
             elif data == b"toggle_ozon_discount":
                 enabled = self.db.get_setting("ozon_discount_filter", "true") == "true"
                 self.db.set_setting("ozon_discount_filter", "false" if enabled else "true")
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Фильтр скидки Ozon обновлён")
+            elif data == b"toggle_wb_stock_filter":
+                enabled = self.db.get_setting("wb_min_stock_filter", "true") == "true"
+                self.db.set_setting("wb_min_stock_filter", "false" if enabled else "true")
+                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.answer("Фильтр минимального остатка WB обновлён")
             elif data == b"select_main_channel":
                 self.db.set_setting("publication_target", "main")
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
