@@ -165,6 +165,47 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             canonical_url="https://ozon.by/product/1440302046/",
         )
 
+    async def test_wb_batch_check_falls_back_when_stock_is_unknown(self):
+        product = make_product()
+        detailed_card = ProductCardData(in_stock=False)
+        fetch_card = AsyncMock(return_value=detailed_card)
+        parser = SimpleNamespace(fetch_card_for_product=fetch_card)
+
+        result = await PipelineMixin.resolve_wb_batch_card(
+            parser,
+            product,
+            ProductCardData(in_stock=None),
+        )
+
+        self.assertIs(result, detailed_card)
+        fetch_card.assert_awaited_once_with(product, source_text="")
+
+    async def test_wb_batch_check_does_not_repeat_confirmed_result(self):
+        product = make_product()
+        confirmed_card = ProductCardData(in_stock=False)
+        fetch_card = AsyncMock()
+        parser = SimpleNamespace(fetch_card_for_product=fetch_card)
+
+        result = await PipelineMixin.resolve_wb_batch_card(
+            parser,
+            product,
+            confirmed_card,
+        )
+
+        self.assertIs(result, confirmed_card)
+        fetch_card.assert_not_awaited()
+
+    async def test_wb_batch_check_falls_back_when_card_is_missing(self):
+        product = make_product()
+        detailed_card = ProductCardData(in_stock=True)
+        fetch_card = AsyncMock(return_value=detailed_card)
+        parser = SimpleNamespace(fetch_card_for_product=fetch_card)
+
+        result = await PipelineMixin.resolve_wb_batch_card(parser, product, None)
+
+        self.assertIs(result, detailed_card)
+        fetch_card.assert_awaited_once_with(product, source_text="")
+
     def parse_stock(self, quantity):
         return parse_wb_detail_payload(
             {
