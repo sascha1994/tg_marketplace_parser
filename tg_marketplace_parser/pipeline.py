@@ -30,6 +30,7 @@ from .message_parsing import (
 )
 from .models import (
     Job,
+    ProductCardData,
     ProductInfo,
 )
 from .presentation import (
@@ -127,6 +128,17 @@ class PipelineMixin:
             messages=messages,
             canonical_url=product.canonical_url,
         )
+
+    async def resolve_wb_batch_card(
+        self,
+        product: ProductInfo,
+        batch_card: ProductCardData | None,
+        *,
+        source_text: str = "",
+    ) -> ProductCardData | None:
+        if batch_card is not None and batch_card.in_stock is not None:
+            return batch_card
+        return await self.fetch_card_for_product(product, source_text=source_text)
 
     def ozon_discount_filter_enabled(self) -> bool:
         return self.db.get_setting("ozon_discount_filter", "true") == "true"
@@ -362,7 +374,26 @@ class PipelineMixin:
                             self.record_admin_error(f"Пакетная проверка отложенных WB: {type(exc).__name__}: {exc}")
                         for row in wb_rows:
                             product = ProductInfo(**json.loads(row["product_json"]))
-                            await self.handle_scheduled_publication(row, cards.get(product.sku or ""))
+                            card = cards.get(product.sku or "")
+                            if card is None or card.in_stock is None:
+                                try:
+                                    card = await self.resolve_wb_batch_card(
+                                        product,
+                                        card,
+                                        source_text=row["source_text"],
+                                    )
+                                except Exception as exc:
+                                    card = None
+                                    self.record_admin_error(
+                                        f"Индивидуальная проверка отложенной публикации WB "
+                                        f"{product.sku}: {type(exc).__name__}: {exc}"
+                                    )
+                                    log(
+                                        f"Индивидуальная проверка отложенной публикации WB "
+                                        f"{product.sku} завершилась ошибкой: {exc}",
+                                        logging.WARNING,
+                                    )
+                            await self.handle_scheduled_publication(row, card)
                         await asyncio.sleep(1)
                         continue
 
@@ -417,6 +448,20 @@ class PipelineMixin:
                 for row in due_wb_posts:
                     product = products_by_key[row["sku_key"]]
                     card = cards.get(product.sku or "")
+                    if card is None or card.in_stock is None:
+                        try:
+                            card = await self.resolve_wb_batch_card(product, card)
+                        except Exception as exc:
+                            card = None
+                            self.record_admin_error(
+                                f"Индивидуальная проверка наличия WB {product.sku}: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            log(
+                                f"Индивидуальная проверка наличия WB "
+                                f"{product.sku} завершилась ошибкой: {exc}",
+                                logging.WARNING,
+                            )
                     await self.handle_published_post_check(row, product, card, now)
                 await asyncio.sleep(1)
                 continue
