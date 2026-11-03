@@ -1,7 +1,7 @@
 services:
-  tg_deals_parser_v3:
+  tg_deals_parser:
     image: ghcr.io/sascha1994/tg_marketplace_parser:${PARSER_IMAGE_TAG:-latest}
-    container_name: tg_deals_parser_v3
+    container_name: tg_deals_parser
     restart: unless-stopped
     init: true
     shm_size: "1gb"
