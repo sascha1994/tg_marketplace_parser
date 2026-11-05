@@ -348,7 +348,7 @@ class WildberriesMixin:
             if browser_card is not None:
                 if browser_card.in_stock is False and (card_data is None or card_data.price_byn is None):
                     return replace(
-                        merge_card_data(card_data, browser_card),
+                        merge_card_data(card_data, browser_card) or browser_card,
                         in_stock=False,
                         price_byn=None,
                     )
@@ -372,7 +372,7 @@ class WildberriesMixin:
                     )
                     if wp_card is not None:
                         if wp_card.in_stock is False and (card_data is None or card_data.price_byn is None):
-                            return replace(merge_card_data(card_data, wp_card), in_stock=False, price_byn=None)
+                            return replace(merge_card_data(card_data, wp_card) or wp_card, in_stock=False, price_byn=None)
                         card_data = merge_card_data(card_data, wp_card)
                         if card_data and card_data.title and card_data.price_byn is not None:
                             return card_data
@@ -382,7 +382,7 @@ class WildberriesMixin:
             wp_card = parse_webpage_preview_card(wp_obj, default_currency="BYN", rub_to_byn_rate=rub_rate)
             if wp_card is not None:
                 if wp_card.in_stock is False and (card_data is None or card_data.price_byn is None):
-                    return replace(merge_card_data(card_data, wp_card), in_stock=False, price_byn=None)
+                    return replace(merge_card_data(card_data, wp_card) or wp_card, in_stock=False, price_byn=None)
                 card_data = merge_card_data(card_data, wp_card)
 
         # 6. Если живой эндпоинт цен закрыт антиботом (403), но карточка существует и не помечена как «нет в наличии»:

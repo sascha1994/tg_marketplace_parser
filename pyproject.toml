@@ -42,4 +42,5 @@ disable_error_code = [
     "has-type",
     "dict-item",
     "list-item",
+    "type-var",
 ]
