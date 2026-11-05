@@ -475,6 +475,42 @@ class PipelineMixin:
                     logging.WARNING,
                 )
 
+    async def check_wb_batch(
+        self,
+        wb_rows: list[dict],
+        *,
+        batch_error_label: str,
+        item_error_label: str,
+        include_source_text: bool = False,
+    ) -> list[tuple[dict, ProductInfo, ProductCardData | None]]:
+        """Пакетно проверяет карточки Wildberries с откатом на индивидуальную проверку при неясном наличии."""
+        products = [ProductInfo(**json.loads(row["product_json"])) for row in wb_rows]
+        try:
+            cards = await self.fetch_wb_cards_batch(product.sku or "" for product in products)
+        except Exception as exc:
+            cards = {}
+            self.record_admin_error(f"{batch_error_label}: {type(exc).__name__}: {exc}")
+            log(f"Ошибка ({batch_error_label}): {exc}", logging.WARNING)
+
+        results: list[tuple[dict, ProductInfo, ProductCardData | None]] = []
+        for row, product in zip(wb_rows, products):
+            card = cards.get(product.sku or "")
+            if card is None or card.in_stock is None:
+                try:
+                    kwargs = {"source_text": row.get("source_text", "")} if include_source_text else {}
+                    card = await self.resolve_wb_batch_card(product, card, **kwargs)
+                except Exception as exc:
+                    card = None
+                    self.record_admin_error(
+                        f"{item_error_label} {product.sku}: {type(exc).__name__}: {exc}"
+                    )
+                    log(
+                        f"{item_error_label} {product.sku} завершилась ошибкой: {exc}",
+                        logging.WARNING,
+                    )
+            results.append((row, product, card))
+        return results
+
     async def scheduled_publication_worker(self) -> None:
         while True:
             now = int(time.time())
@@ -486,35 +522,13 @@ class PipelineMixin:
                         if json.loads(row["product_json"]).get("platform") == "Wildberries"
                     ]
                     if len(wb_rows) > 1:
-                        try:
-                            cards = await self.fetch_wb_cards_batch(
-                                json.loads(row["product_json"]).get("sku") or ""
-                                for row in wb_rows
-                            )
-                        except Exception as exc:
-                            cards = {}
-                            self.record_admin_error(f"Пакетная проверка отложенных WB: {type(exc).__name__}: {exc}")
-                        for row in wb_rows:
-                            product = ProductInfo(**json.loads(row["product_json"]))
-                            card = cards.get(product.sku or "")
-                            if card is None or card.in_stock is None:
-                                try:
-                                    card = await self.resolve_wb_batch_card(
-                                        product,
-                                        card,
-                                        source_text=row["source_text"],
-                                    )
-                                except Exception as exc:
-                                    card = None
-                                    self.record_admin_error(
-                                        f"Индивидуальная проверка отложенной публикации WB "
-                                        f"{product.sku}: {type(exc).__name__}: {exc}"
-                                    )
-                                    log(
-                                        f"Индивидуальная проверка отложенной публикации WB "
-                                        f"{product.sku} завершилась ошибкой: {exc}",
-                                        logging.WARNING,
-                                    )
+                        checked = await self.check_wb_batch(
+                            wb_rows,
+                            batch_error_label="Пакетная проверка отложенных WB",
+                            item_error_label="Индивидуальная проверка отложенной публикации WB",
+                            include_source_text=True,
+                        )
+                        for row, _product, card in checked:
                             await self.handle_scheduled_publication(row, card)
                         await asyncio.sleep(1)
                         continue
@@ -555,35 +569,12 @@ class PipelineMixin:
                 if json.loads(row["product_json"]).get("platform") == "Wildberries"
             ]
             if len(due_wb_posts) > 1:
-                products_by_key = {
-                    row["sku_key"]: ProductInfo(**json.loads(row["product_json"]))
-                    for row in due_wb_posts
-                }
-                try:
-                    cards = await self.fetch_wb_cards_batch(
-                        product.sku or "" for product in products_by_key.values()
-                    )
-                except Exception as exc:
-                    cards = {}
-                    self.record_admin_error(f"Пакетная проверка WB: {type(exc).__name__}: {exc}")
-                    log(f"Ошибка пакетной проверки WB: {exc}", logging.WARNING)
-                for row in due_wb_posts:
-                    product = products_by_key[row["sku_key"]]
-                    card = cards.get(product.sku or "")
-                    if card is None or card.in_stock is None:
-                        try:
-                            card = await self.resolve_wb_batch_card(product, card)
-                        except Exception as exc:
-                            card = None
-                            self.record_admin_error(
-                                f"Индивидуальная проверка наличия WB {product.sku}: "
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                            log(
-                                f"Индивидуальная проверка наличия WB "
-                                f"{product.sku} завершилась ошибкой: {exc}",
-                                logging.WARNING,
-                            )
+                checked_posts = await self.check_wb_batch(
+                    due_wb_posts,
+                    batch_error_label="Пакетная проверка WB",
+                    item_error_label="Индивидуальная проверка наличия WB",
+                )
+                for row, product, card in checked_posts:
                     await self.handle_published_post_check(row, product, card, now)
                 await asyncio.sleep(1)
                 continue

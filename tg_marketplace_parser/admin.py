@@ -6,6 +6,7 @@ from telethon import (
     events,
 )
 import time
+from . import thresholds
 from .common import log
 from .common import validate_marketplace_url
 from .message_parsing import extract_links
@@ -35,6 +36,8 @@ class AdminMixin:
         quiet_hours_enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
         discount_filter = self.db.get_setting("ozon_discount_filter", "true") == "true"
         wb_stock_filter = self.db.get_setting("wb_min_stock_filter", "true") == "true"
+        ozon_min_disc = thresholds.ozon_min_discount(self)
+        wb_min_stk = thresholds.wb_min_stock(self)
         selected_target = self.db.get_setting("publication_target", "main")
         target_label = "тестовый" if selected_target == "test" else "основной"
         return (
@@ -47,8 +50,8 @@ class AdminMixin:
             f"Тестовый канал: {'настроен' if self.settings.test_channel else 'не настроен'}\n"
             f"Ограничение по времени: {'включено' if quiet_hours_enabled else 'выключено'}\n"
             f"Перерыв публикаций: {quiet_start}–{quiet_end} ({self.settings.timezone})\n"
-            f"Фильтр скидки Ozon ≥30%: {'включён' if discount_filter else 'выключен'}\n"
-            f"Фильтр остатков WB ≥3: {'включён' if wb_stock_filter else 'выключен'}\n"
+            f"Фильтр скидки Ozon ≥{ozon_min_disc:g}%: {'включён' if discount_filter else 'выключен'}\n"
+            f"Фильтр остатков WB ≥{wb_min_stk}: {'включён' if wb_stock_filter else 'выключен'}\n"
             f"Аптайм: {hours}ч {minutes}м {seconds}с\n\n"
             f"🛡 Антибот и карточки:\n"
             f"• Браузер (Playwright): {browser_state}\n"
@@ -73,10 +76,12 @@ class AdminMixin:
             if self.state.is_paused
             else Button.inline("⏸ Пауза", b"pause")
         )
+        ozon_min_disc = thresholds.ozon_min_discount(self)
+        wb_min_stk = thresholds.wb_min_stock(self)
         discount_label = (
-            "✅ Фильтр Ozon ≥30%: ВКЛ"
+            f"✅ Фильтр Ozon ≥{ozon_min_disc:g}%: ВКЛ"
             if self.db.get_setting("ozon_discount_filter", "true") == "true"
-            else "⏸ Фильтр Ozon ≥30%: ВЫКЛ"
+            else f"⏸ Фильтр Ozon ≥{ozon_min_disc:g}%: ВЫКЛ"
         )
         quiet_hours_label = (
             "✅ Перерыв по времени: ВКЛ"
@@ -84,9 +89,9 @@ class AdminMixin:
             else "⏸ Перерыв по времени: ВЫКЛ"
         )
         wb_stock_filter_label = (
-            "✅ Остаток WB ≥3: ВКЛ"
+            f"✅ Остаток WB ≥{wb_min_stk}: ВКЛ"
             if self.db.get_setting("wb_min_stock_filter", "true") == "true"
-            else "⏸ Остаток WB ≥3: ВЫКЛ"
+            else f"⏸ Остаток WB ≥{wb_min_stk}: ВЫКЛ"
         )
         selected_target = self.db.get_setting("publication_target", "main")
         target_buttons = [
@@ -109,6 +114,15 @@ class AdminMixin:
             [Button.inline("⏰ Настроить интервал перерыва", b"edit_schedule")],
             [Button.inline(discount_label, b"toggle_ozon_discount")],
             [Button.inline(wb_stock_filter_label, b"toggle_wb_stock_filter")],
+            [
+                Button.inline("🎯 Порог Ozon %", b"edit_ozon_discount_threshold"),
+                Button.inline("📦 Мин. остаток WB", b"edit_wb_stock_threshold"),
+            ],
+            [
+                Button.inline("📈 Источники", b"source_stats"),
+                Button.inline("🧪 Каскад", b"cascade_stats"),
+                Button.inline("🚫 Блок-лист", b"blocklist_view"),
+            ],
             [Button.inline("📜 Последняя обработка", b"recent_jobs")],
             [Button.inline("⚠️ Последние ошибки", b"recent_errors")],
             [Button.inline("🔄 Обновить источники", b"reload_sources")],
@@ -140,6 +154,64 @@ class AdminMixin:
             rows.append(f"{when} · {message}")
         return "\n".join(rows)
 
+    def get_source_stats_text(self) -> str:
+        rows_data = self.db.get_top_sources(limit=15)
+        if not rows_data:
+            return "📈 Статистика по источникам пока пуста."
+        lines = ["📈 Статистика по источникам (топ-15):"]
+        for item in rows_data:
+            lines.append(
+                f"• {item['chat_id']}: получено {item['received']}, "
+                f"опубл. {item['published']}, откл. {item['rejected']}, дубл. {item['duplicates']}"
+            )
+        return "\n".join(lines)
+
+    def get_cascade_stats_text(self) -> str:
+        stats = getattr(self.state, "cascade_stats", None) or {}
+        if not stats:
+            return "🧪 Статистика каскада пока пуста."
+        lines = ["🧪 Успешность шагов каскада:"]
+        for step, counters in sorted(stats.items()):
+            ok, fail = counters[0], counters[1]
+            total = ok + fail
+            rate = (ok * 100.0 / total) if total > 0 else 0.0
+            lines.append(f"• {step}: {ok}/{total} ({rate:.0f}%)")
+        return "\n".join(lines)
+
+    def get_blocklist_text(self) -> str:
+        items = self.db.list_blocks()
+        if not items:
+            return (
+                "🚫 Чёрный список пуст.\n\n"
+                "Команды управления:\n"
+                "/block brand <название>\n"
+                "/block keyword <слово>\n"
+                "/unblock brand <название>\n"
+                "/unblock keyword <слово>"
+            )
+        lines = ["🚫 Чёрный список:"]
+        for kind, val in items:
+            label = "Бренд" if kind == "brand" else "Слово"
+            lines.append(f"• {label}: {val}")
+        lines.append(
+            "\nДля удаления: /unblock brand <название> или /unblock keyword <слово>"
+        )
+        return "\n".join(lines)
+
+    def handle_admin_block_command(self, raw_text: str) -> str | None:
+        text = (raw_text or "").strip()
+        if text == "/blocklist":
+            return self.get_blocklist_text()
+        m = re.match(r"^/(block|unblock)\s+(brand|keyword)\s+(.+)$", text, flags=re.IGNORECASE)
+        if not m:
+            return None
+        action, kind, val = m.group(1).lower(), m.group(2).lower(), m.group(3).strip()
+        if action == "block":
+            added = self.db.add_block(kind, val)
+            return f"✅ Добавлено в чёрный список ({kind}): {val}" if added else "ℹ️ Уже есть в чёрном списке."
+        removed = self.db.remove_block(kind, val)
+        return f"✅ Удалено из чёрного списка ({kind}): {val}" if removed else "ℹ️ Не найдено в чёрном списке."
+
     async def notify_admin(self, text: str) -> None:
         with suppress(Exception):
             await self.bot_client.send_message(self.settings.admin_id, text, link_preview=False)
@@ -166,24 +238,57 @@ class AdminMixin:
         await event.respond(f"{source} отправлена на проверку и публикацию в тестовый канал.")
         return True
 
+    def _reset_admin_input_modes(self) -> None:
+        self.awaiting_schedule_input = False
+        self.awaiting_ozon_discount_input = False
+        self.awaiting_wb_stock_input = False
+
     def _register_admin_handlers(self) -> None:
         @self.bot_client.on(events.NewMessage(chats=self.settings.admin_id, pattern=r"^/start$"))
         async def admin_start(event):
             if event.sender_id != self.settings.admin_id:
                 return
-            self.awaiting_schedule_input = False
+            self._reset_admin_input_modes()
             await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
 
         @self.bot_client.on(events.NewMessage(chats=self.settings.admin_id))
         async def admin_settings_input(event):
             if event.sender_id != self.settings.admin_id:
                 return
+            value = (event.raw_text or "").strip()
+            block_reply = self.handle_admin_block_command(value)
+            if block_reply is not None:
+                await event.respond(block_reply, buttons=[[Button.inline("↩️ В панель", b"refresh")]])
+                return
             if await self.enqueue_admin_test_message(event):
                 return
-            if not self.awaiting_schedule_input:
-                return
-            value = (event.raw_text or "").strip()
             if value.startswith("/"):
+                return
+            if getattr(self, "awaiting_ozon_discount_input", False):
+                try:
+                    num = float(value.replace(",", "."))
+                    if not (1 <= num <= 95):
+                        raise ValueError
+                except ValueError:
+                    await event.respond("Введите число от 1 до 95 (например, 30).")
+                    return
+                self.db.set_setting("ozon_min_discount_percent", f"{num:g}")
+                self._reset_admin_input_modes()
+                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                return
+            if getattr(self, "awaiting_wb_stock_input", False):
+                try:
+                    num_int = int(value)
+                    if not (1 <= num_int <= 1000):
+                        raise ValueError
+                except ValueError:
+                    await event.respond("Введите целое число от 1 до 1000 (например, 3).")
+                    return
+                self.db.set_setting("wb_min_stock", str(num_int))
+                self._reset_admin_input_modes()
+                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                return
+            if not self.awaiting_schedule_input:
                 return
             match = re.fullmatch(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})", value)
             if not match:
@@ -207,7 +312,7 @@ class AdminMixin:
             end_value = f"{end_hour:02d}:{end_minute:02d}"
             self.db.set_setting("quiet_hours_start", start_value)
             self.db.set_setting("quiet_hours_end", end_value)
-            self.awaiting_schedule_input = False
+            self._reset_admin_input_modes()
             await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
 
         @self.bot_client.on(events.CallbackQuery(chats=self.settings.admin_id))
@@ -217,7 +322,7 @@ class AdminMixin:
                 return
             data = event.data
             if data == b"refresh":
-                self.awaiting_schedule_input = False
+                self._reset_admin_input_modes()
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Данные обновлены")
             elif data == b"recent_jobs":
@@ -232,6 +337,24 @@ class AdminMixin:
                     buttons=[[Button.inline("↩️ В панель", b"refresh")]],
                 )
                 await event.answer()
+            elif data == b"source_stats":
+                await event.edit(
+                    self.get_source_stats_text(),
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
+            elif data == b"cascade_stats":
+                await event.edit(
+                    self.get_cascade_stats_text(),
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
+            elif data == b"blocklist_view":
+                await event.edit(
+                    self.get_blocklist_text(),
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
             elif data == b"pause":
                 self.state.is_paused = True
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
@@ -241,10 +364,27 @@ class AdminMixin:
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Парсинг возобновлён")
             elif data == b"edit_schedule":
+                self._reset_admin_input_modes()
                 self.awaiting_schedule_input = True
                 await event.edit(
                     "Отправьте интервал запрета публикаций в формате ЧЧ:ММ-ЧЧ:ММ "
                     f"(временная зона {self.settings.timezone}). Например: 01:30-07:00.",
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
+            elif data == b"edit_ozon_discount_threshold":
+                self._reset_admin_input_modes()
+                self.awaiting_ozon_discount_input = True
+                await event.edit(
+                    "Отправьте минимальный процент скидки Ozon (от 1 до 95), например: 30",
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
+            elif data == b"edit_wb_stock_threshold":
+                self._reset_admin_input_modes()
+                self.awaiting_wb_stock_input = True
+                await event.edit(
+                    "Отправьте минимальный остаток WB (целое число от 1 до 1000), например: 3",
                     buttons=[[Button.inline("↩️ В панель", b"refresh")]],
                 )
                 await event.answer()

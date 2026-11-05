@@ -49,5 +49,7 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self._rate_updated_at: float = 0.0
         self._rate_lock = asyncio.Lock()
         self.awaiting_schedule_input = False
+        self.awaiting_ozon_discount_input = False
+        self.awaiting_wb_stock_input = False
         self._last_ozon_stock_check_at = 0.0
         self._register_admin_handlers()

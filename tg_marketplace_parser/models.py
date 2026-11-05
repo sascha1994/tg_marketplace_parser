@@ -121,3 +121,11 @@ class ParserState:
         """Считает успехи и неудачи шага каскада получения данных карточки."""
         counters = self.cascade_stats.setdefault(step, [0, 0])
         counters[0 if success else 1] += 1
+
+
+def record_cascade(owner: object, step: str, success: bool) -> None:
+    """Безопасно фиксирует результат шага каскада на объекте владельца (если есть state)."""
+    state = getattr(owner, "state", None)
+    recorder = getattr(state, "record_cascade", None)
+    if callable(recorder):
+        recorder(step, success)
