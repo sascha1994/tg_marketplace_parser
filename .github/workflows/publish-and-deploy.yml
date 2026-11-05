@@ -27,9 +27,15 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run ruff linter
+        run: python -m ruff check .
+      - name: Run mypy type check
+        run: python -m mypy tg_marketplace_parser
       - name: Run tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python files

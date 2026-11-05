@@ -11,7 +11,7 @@ def _load_curl_cffi():
     except ImportError:
         pass
 
-    if os.getenv("AUTO_INSTALL_CURL_CFFI", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+    if os.getenv("AUTO_INSTALL_CURL_CFFI", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
 
     for extra_args in ([], ["--break-system-packages"], ["--user"]):
@@ -47,7 +47,7 @@ def _load_async_playwright():
         from playwright.async_api import async_playwright
         return async_playwright
 
-    if os.getenv("AUTO_INSTALL_PLAYWRIGHT", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+    if os.getenv("AUTO_INSTALL_PLAYWRIGHT", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
 
     for extra_args in ([], ["--break-system-packages"], ["--user"]):
@@ -102,7 +102,7 @@ def _find_system_chromium() -> str | None:
 def _ensure_playwright_browser_installed() -> None:
     if _find_system_chromium():
         return
-    if os.getenv("AUTO_INSTALL_PLAYWRIGHT", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+    if os.getenv("AUTO_INSTALL_PLAYWRIGHT", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         return
     with suppress(Exception):
         subprocess.run(

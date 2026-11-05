@@ -1,0 +1,20 @@
+{
+  "data": {
+    "products": [
+      {
+        "id": 12345678,
+        "name": "Тестовый рюкзак городской",
+        "brand": "Bagster",
+        "reviewRating": 4.7,
+        "feedbacks": 350,
+        "totalQuantity": 7,
+        "sizes": [
+          {
+            "price": {"product": 4599, "basic": 7999},
+            "stocks": [{"qty": 4}, {"qty": 3}]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -716,7 +716,7 @@ class MarketDataMixin:
                     return card_data
 
         # 5. Проверяем Telegram GetWebPageRequest и WebPage-превью исходного сообщения
-        if self.user_client.is_connected() and "GetWebPageRequest" in globals() and (
+        if self.user_client.is_connected() and (
             card_data is None or not card_data.title or card_data.price_byn is None
         ):
             for wb_host, def_curr in (("www.wildberries.by", "BYN"), ("www.wildberries.ru", "RUB")):
@@ -929,7 +929,7 @@ class MarketDataMixin:
                                     return card_data
 
         # 4. Пробуем Telegram GetWebPageRequest для https://ozon.by/product/<sku>/ и превью сообщения
-        if self.user_client.is_connected() and "GetWebPageRequest" in globals() and (
+        if self.user_client.is_connected() and (
             card_data is None or not card_data.title or card_data.price_byn is None
         ):
             for host in ("ozon.by", "www.ozon.ru"):
@@ -1173,7 +1173,7 @@ class MarketDataMixin:
                 if mirror not in candidate_urls:
                     candidate_urls.append(mirror)
 
-        if "GetWebPageRequest" in globals():
+        if self.user_client is not None:
             for target_url in candidate_urls:
                 for wait_attempt in range(2):
                     try:
@@ -1192,7 +1192,7 @@ class MarketDataMixin:
                         log(f"GetWebPageRequest ошибка для {target_url}: {type(exc).__name__}: {exc}", logging.DEBUG)
                         break
 
-        if "GetWebPagePreviewRequest" in globals():
+        if self.user_client is not None:
             for target_url in candidate_urls[:2]:
                 with suppress(Exception):
                     media = await self.user_client(GetWebPagePreviewRequest(message=target_url))

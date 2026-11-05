@@ -1,0 +1,25 @@
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+extend-exclude = [".venv", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+ignore = [
+    "E501",  # длинные строки допустимы (русские сообщения и регулярные выражения)
+    "E701",
+    "B008",
+    "B904",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"parser.py" = ["F401", "F403"]
+"tg_marketplace_parser/core.py" = ["F401", "F403"]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_unused_ignores = false
+files = ["tg_marketplace_parser"]
