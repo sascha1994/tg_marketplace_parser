@@ -375,7 +375,11 @@ class OzonBrowserMixin:
                 with suppress(Exception):
                     await nav_page.route("**/*", _fast_route_handler)
 
-                async def _handle_ozon_response(resp, curr: str = default_currency) -> None:
+                async def _handle_ozon_response(
+                    resp,
+                    curr: str = default_currency,
+                    base_card: ProductCardData | None = inpage_card,
+                ) -> None:
                     nonlocal intercepted_avg_byn, intercepted_card
                     with suppress(Exception):
                         r_url = (resp.url or "").lower()
@@ -394,11 +398,11 @@ class OzonBrowserMixin:
                             if not txt:
                                 return
                             ref_price = (
-                                (inpage_card.price_byn if inpage_card else None)
+                                (base_card.price_byn if base_card else None)
                                 or (intercepted_card.price_byn if intercepted_card else None)
                             )
                             ref_old = (
-                                (inpage_card.old_price_byn if inpage_card else None)
+                                (base_card.old_price_byn if base_card else None)
                                 or (intercepted_card.old_price_byn if intercepted_card else None)
                             )
                             payload_obj = json.loads(txt)
@@ -678,9 +682,9 @@ class OzonBrowserMixin:
                 captured_urls: list[str] = []
                 loop_aborted = False
 
-                def _on_url_candidate(candidate_url: str) -> None:
+                def _on_url_candidate(candidate_url: str, urls: list[str] = captured_urls) -> None:
                     if candidate_url and has_expanded_product_url(candidate_url):
-                        captured_urls.append(candidate_url)
+                        urls.append(candidate_url)
 
                 def _handle_request(req) -> None:
                     _on_url_candidate(req.url)
@@ -692,15 +696,15 @@ class OzonBrowserMixin:
                         full_loc = urljoin(resp.url, loc)
                         _on_url_candidate(full_loc)
 
-                def _handle_frame_navigated(frame) -> None:
-                    if frame == nav_page.main_frame:
+                def _handle_frame_navigated(frame, page=nav_page) -> None:
+                    if frame == page.main_frame:
                         _on_url_candidate(frame.url)
 
-                async def _route_handler(route) -> None:
+                async def _route_handler(route, urls: list[str] = captured_urls) -> None:
                     nonlocal loop_aborted
                     req_url = route.request.url
                     if has_expanded_product_url(req_url):
-                        captured_urls.append(req_url)
+                        urls.append(req_url)
                     if "__rr=" in req_url and not has_expanded_product_url(req_url):
                         qs = parse_qs(urlparse(req_url).query)
                         try:

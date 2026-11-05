@@ -89,7 +89,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Trigger Dockhand webhook
-        if: env.DOCKHAND_WEBHOOK_URL != ''
         env:
           DOCKHAND_WEBHOOK_URL: ${{ secrets.DOCKHAND_WEBHOOK_URL }}
-        run: curl -fsSL -X POST "$DOCKHAND_WEBHOOK_URL"
+        run: |
+          if [ -n "$DOCKHAND_WEBHOOK_URL" ]; then
+            curl -fsSL -X POST "$DOCKHAND_WEBHOOK_URL"
+          else
+            echo "DOCKHAND_WEBHOOK_URL is not set, skipping webhook trigger."
+          fi

@@ -493,7 +493,7 @@ class PipelineMixin:
             log(f"Ошибка ({batch_error_label}): {exc}", logging.WARNING)
 
         results: list[tuple[dict, ProductInfo, ProductCardData | None]] = []
-        for row, product in zip(wb_rows, products):
+        for row, product in zip(wb_rows, products, strict=False):
             card = cards.get(product.sku or "")
             if card is None or card.in_stock is None:
                 try:
@@ -665,7 +665,7 @@ class PipelineMixin:
                 *(self.resolve_url(url) for _, url in urls_to_resolve),
                 return_exceptions=True,
             )
-            for (idx, original_url), result in zip(urls_to_resolve, net_results):
+            for (idx, original_url), result in zip(urls_to_resolve, net_results, strict=False):
                 if isinstance(result, Exception):
                     log(f"Ошибка раскрытия {original_url}: {result}", logging.WARNING)
                     self.record_admin_error(f"Не удалось раскрыть ссылку: {type(result).__name__}")
@@ -744,7 +744,7 @@ class PipelineMixin:
 
         available_products: list[ProductInfo] = []
         failed_keys: list[str] = []
-        for orig_prod, enriched in zip(fresh_candidates, enriched_results):
+        for orig_prod, enriched in zip(fresh_candidates, enriched_results, strict=False):
             if isinstance(enriched, Exception):
                 log(
                     f"Ошибка парсинга карточки {orig_prod.platform} ({orig_prod.sku}): {enriched}",

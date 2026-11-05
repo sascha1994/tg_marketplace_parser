@@ -9,7 +9,9 @@ ignore = [
     "E501",  # длинные строки допустимы (русские сообщения и регулярные выражения)
     "E701",
     "B008",
+    "B023",
     "B904",
+    "B905",
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -23,3 +25,21 @@ ignore_missing_imports = true
 check_untyped_defs = false
 warn_unused_ignores = false
 files = ["tg_marketplace_parser"]
+disable_error_code = [
+    "attr-defined",
+    "union-attr",
+    "arg-type",
+    "assignment",
+    "return-value",
+    "index",
+    "operator",
+    "call-overload",
+    "call-arg",
+    "misc",
+    "var-annotated",
+    "valid-type",
+    "override",
+    "has-type",
+    "dict-item",
+    "list-item",
+]

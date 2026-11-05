@@ -169,7 +169,7 @@ class DuplicateDB:
                 rows = self._conn.execute("SELECT * FROM published_posts_legacy").fetchall()
                 names = [row[1] for row in self._conn.execute("PRAGMA table_info(published_posts_legacy)")]
                 for values in rows:
-                    old = dict(zip(names, values))
+                    old = dict(zip(names, values, strict=False))
                     message_ids = old.get("message_ids") or "[]"
                     try:
                         parsed_ids = json.loads(message_ids)
