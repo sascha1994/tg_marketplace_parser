@@ -175,14 +175,27 @@ def normalize_image_url(url: str | None) -> str:
         cleaned = re.sub(r"/wc\d+/", "/wc1000/", cleaned)
     return cleaned
 
+def _is_complete_raw_image(raw_bytes: bytes) -> bool:
+    """Проверяет базовые маркеры целостности контейнера для JPEG и PNG."""
+    if not raw_bytes or len(raw_bytes) < 32:
+        return False
+    if raw_bytes.startswith(b"\xff\xd8\xff"):
+        return raw_bytes.rstrip(b"\x00\r\n\t ").endswith(b"\xff\xd9")
+    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw_bytes.rstrip(b"\x00\r\n\t ").endswith(b"IEND\xaeB`\x82")
+    return True
+
 def convert_image_bytes_to_jpeg(raw_bytes: bytes) -> io.BytesIO | None:
     """Готовит изображение в памяти с именем product.jpg, конвертируя WEBP/PNG в JPEG (чтобы Telegram не отправлял его как стикер)."""
-    if not raw_bytes or len(raw_bytes) < 32:
+    if not _is_complete_raw_image(raw_bytes):
         return None
 
-    if "PILImage" in globals():
+    if PILImage is not None:
         with suppress(Exception):
             with PILImage.open(io.BytesIO(raw_bytes)) as img:
+                img.load()
+                if img.width <= 0 or img.height <= 0:
+                    return None
                 if img.mode not in ("RGB", "L"):
                     bg = PILImage.new("RGB", img.size, (255, 255, 255))
                     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
@@ -198,9 +211,10 @@ def convert_image_bytes_to_jpeg(raw_bytes: bytes) -> io.BytesIO | None:
                 buf.seek(0)
                 buf.name = "product.jpg"
                 return buf
+        return None
 
-    # Если Pillow не установлен, проверяем, что это не WEBP (WEBP без конвертации Telegram считает стикером)
-    if raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
+    # Если Pillow не установлен, пропускаем только целые JPEG/PNG (WEBP Telegram считает стикером)
+    if not raw_bytes.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n")):
         return None
 
     buf = io.BytesIO(raw_bytes)

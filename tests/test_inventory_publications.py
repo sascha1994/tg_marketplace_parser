@@ -15,6 +15,7 @@ from tg_marketplace_parser.message_parsing import extract_product_url_from_text
 from tg_marketplace_parser.config import Settings
 from tg_marketplace_parser.admin import AdminMixin
 from tg_marketplace_parser.common import (
+    convert_image_bytes_to_jpeg,
     has_expanded_product_url,
     has_product_sku,
     ozon_product_path,
@@ -743,6 +744,58 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         checker._fetch_json_url.assert_awaited_once()
         self.assertEqual(set(cards), {"101", "202"})
         self.assertEqual(cards["101"].total_quantity, 3)
+
+    def test_convert_image_bytes_to_jpeg_rejects_truncated_jpeg(self):
+        import io
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), (120, 180, 240)).save(buf, format="JPEG", quality=90)
+        valid_jpeg = buf.getvalue()
+
+        converted = convert_image_bytes_to_jpeg(valid_jpeg)
+        self.assertIsNotNone(converted)
+        self.assertTrue(converted.getvalue().endswith(b"\xff\xd9"))
+
+        truncated_jpeg = valid_jpeg[:-20]
+        self.assertIsNone(convert_image_bytes_to_jpeg(truncated_jpeg))
+
+    async def test_download_product_image_retries_when_first_response_is_truncated(self):
+        import asyncio
+        import io
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), (200, 100, 50)).save(buf, format="JPEG", quality=90)
+        valid_jpeg = buf.getvalue()
+        truncated_jpeg = valid_jpeg[: len(valid_jpeg) // 2]
+
+        responses = [
+            SimpleNamespace(
+                status_code=200,
+                content=truncated_jpeg,
+                headers={"Content-Length": str(len(valid_jpeg))},
+            ),
+            SimpleNamespace(
+                status_code=200,
+                content=valid_jpeg,
+                headers={"Content-Length": str(len(valid_jpeg))},
+            ),
+        ]
+
+        class FakeMarketData(MarketDataMixin):
+            settings = SimpleNamespace(request_timeout_seconds=5)
+            resolve_semaphore = asyncio.Semaphore(2)
+            curl_session = SimpleNamespace(get=AsyncMock(side_effect=responses))
+            http_session = None
+
+        downloader = FakeMarketData()
+        result = await downloader.download_product_image(
+            "https://ir.ozone.ru/s3/multimedia-1/wc1000/12345.jpg"
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(downloader.curl_session.get.await_count, 2)
 
 
 if __name__ == "__main__":
