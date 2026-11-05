@@ -91,6 +91,8 @@ class Job:
     source_chat_id: int
     attempts: int = 0
     target_channel: str | None = None
+    job_id: int | None = None
+    retry_scheduled: bool = False
 
 
 @dataclass
@@ -108,6 +110,14 @@ class ParserState:
     http_resolved: int = 0
     cards_parsed: int = 0
     active_jobs: int = 0
+    recovered_jobs: int = 0
+    caught_up_posts: int = 0
     last_published_at: float | None = None
     recent_jobs: deque = field(default_factory=lambda: deque(maxlen=15))
     recent_errors: deque = field(default_factory=lambda: deque(maxlen=10))
+    cascade_stats: dict = field(default_factory=dict)
+
+    def record_cascade(self, step: str, success: bool) -> None:
+        """Считает успехи и неудачи шага каскада получения данных карточки."""
+        counters = self.cascade_stats.setdefault(step, [0, 0])
+        counters[0 if success else 1] += 1

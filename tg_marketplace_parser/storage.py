@@ -88,6 +88,32 @@ class DuplicateDB:
                 ON published_posts(status, next_check_at);
             CREATE INDEX IF NOT EXISTS idx_published_posts_sku
                 ON published_posts(sku_key);
+            CREATE TABLE IF NOT EXISTS source_cursors (
+                chat_id INTEGER PRIMARY KEY,
+                last_message_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_jobs (
+                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_chat_id INTEGER NOT NULL,
+                message_ids TEXT NOT NULL,
+                target_channel TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS blocklist (
+                kind TEXT NOT NULL CHECK(kind IN ('brand', 'keyword')),
+                value TEXT NOT NULL,
+                PRIMARY KEY (kind, value)
+            );
+            CREATE TABLE IF NOT EXISTS source_stats (
+                chat_id INTEGER PRIMARY KEY,
+                received INTEGER NOT NULL DEFAULT 0,
+                published INTEGER NOT NULL DEFAULT 0,
+                rejected INTEGER NOT NULL DEFAULT 0,
+                duplicates INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
         self._migrate_publication_tables()
@@ -478,6 +504,149 @@ class DuplicateDB:
         ).fetchall()
         counts = {status: count for status, count in rows}
         return counts.get("published", 0), counts.get("pending", 0)
+
+    # ---- Устойчивая очередь заданий и курсоры источников ----
+
+    def save_job(
+        self,
+        source_chat_id: int,
+        message_ids: Iterable[int],
+        target_channel: str | None = None,
+        attempts: int = 0,
+    ) -> int:
+        cursor = self._conn.execute(
+            "INSERT INTO pending_jobs(source_chat_id, message_ids, target_channel, attempts, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                source_chat_id,
+                json.dumps(sorted(int(item) for item in message_ids)),
+                target_channel,
+                attempts,
+                int(time.time()),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def update_job_attempts(self, job_id: int, attempts: int) -> None:
+        self._conn.execute(
+            "UPDATE pending_jobs SET attempts = ? WHERE job_id = ?",
+            (attempts, job_id),
+        )
+
+    def delete_job(self, job_id: int) -> None:
+        self._conn.execute("DELETE FROM pending_jobs WHERE job_id = ?", (job_id,))
+
+    def load_pending_jobs(self, limit: int = 500) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT job_id, source_chat_id, message_ids, target_channel, attempts "
+            "FROM pending_jobs ORDER BY job_id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        jobs: list[dict] = []
+        for row in rows:
+            try:
+                message_ids = [int(item) for item in json.loads(row[2])]
+            except (TypeError, ValueError):
+                message_ids = []
+            jobs.append(
+                {
+                    "job_id": row[0],
+                    "source_chat_id": row[1],
+                    "message_ids": message_ids,
+                    "target_channel": row[3],
+                    "attempts": row[4],
+                }
+            )
+        return jobs
+
+    def pending_message_ids(self, source_chat_id: int) -> set[int]:
+        result: set[int] = set()
+        for job in self.load_pending_jobs(limit=10_000):
+            if job["source_chat_id"] == source_chat_id:
+                result.update(job["message_ids"])
+        return result
+
+    def get_cursor(self, chat_id: int) -> int | None:
+        row = self._conn.execute(
+            "SELECT last_message_id FROM source_cursors WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def set_cursor(self, chat_id: int, message_id: int) -> None:
+        self._conn.execute(
+            "INSERT INTO source_cursors(chat_id, last_message_id, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "last_message_id = MAX(last_message_id, excluded.last_message_id), "
+            "updated_at = excluded.updated_at",
+            (chat_id, message_id, int(time.time())),
+        )
+
+    # ---- Чёрный список ----
+
+    def add_block(self, kind: str, value: str) -> bool:
+        normalized = " ".join(value.casefold().split())
+        if kind not in {"brand", "keyword"} or not normalized:
+            return False
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO blocklist(kind, value) VALUES (?, ?)",
+            (kind, normalized),
+        )
+        return cursor.rowcount > 0
+
+    def remove_block(self, kind: str, value: str) -> bool:
+        normalized = " ".join(value.casefold().split())
+        cursor = self._conn.execute(
+            "DELETE FROM blocklist WHERE kind = ? AND value = ?",
+            (kind, normalized),
+        )
+        return cursor.rowcount > 0
+
+    def list_blocks(self) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT kind, value FROM blocklist ORDER BY kind, value"
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def find_block_match(self, brand: str, title: str) -> str | None:
+        """Возвращает описание сработавшего правила чёрного списка или None."""
+        brand_text = " ".join((brand or "").casefold().split())
+        haystack = " ".join(f"{brand} {title}".casefold().split())
+        for kind, value in self.list_blocks():
+            if kind == "brand" and brand_text and value == brand_text:
+                return f"бренд «{value}»"
+            if kind == "keyword" and value in haystack:
+                return f"слово «{value}»"
+        return None
+
+    # ---- Статистика источников ----
+
+    def bump_source_stat(self, chat_id: int, field_name: str, amount: int = 1) -> None:
+        if field_name not in {"received", "published", "rejected", "duplicates"}:
+            raise ValueError(f"unknown source stat: {field_name}")
+        self._conn.execute(
+            f"INSERT INTO source_stats(chat_id, {field_name}, updated_at) VALUES (?, ?, ?) "
+            f"ON CONFLICT(chat_id) DO UPDATE SET "
+            f"{field_name} = {field_name} + excluded.{field_name}, updated_at = excluded.updated_at",
+            (chat_id, amount, int(time.time())),
+        )
+
+    def get_top_sources(self, limit: int = 10) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT chat_id, received, published, rejected, duplicates FROM source_stats "
+            "ORDER BY published DESC, received DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "chat_id": row[0],
+                "received": row[1],
+                "published": row[2],
+                "rejected": row[3],
+                "duplicates": row[4],
+            }
+            for row in rows
+        ]
 
     def close(self) -> None:
         with suppress(Exception):

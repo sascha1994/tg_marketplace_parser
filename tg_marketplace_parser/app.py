@@ -35,6 +35,9 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self.workers: list[asyncio.Task] = []
         self.publication_scheduler_task: asyncio.Task | None = None
         self.retry_tasks: set[asyncio.Task] = set()
+        self.heartbeat_task: asyncio.Task | None = None
+        self._inflight_job_ids: set[int] = set()
+        self._overflow_pending = False
         self.resolve_semaphore = asyncio.Semaphore(8)
         self.publish_lock = asyncio.Lock()
         self.publication_gate_lock = asyncio.Lock()

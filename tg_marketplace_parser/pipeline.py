@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, time as datetime_time, timedelta
 from telethon.errors import FloodWaitError
@@ -9,6 +10,7 @@ from telethon.tl.types import MessageEntityStrike, MessageEntityUrl, MessageMedi
 import time
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
+from . import thresholds
 from .common import (
     has_expanded_product_url,
     is_ozon_host,
@@ -51,10 +53,12 @@ class PipelineMixin:
         self.state.recent_errors.append((time.time(), message[:240]))
 
     async def incoming_post_handler(self, event) -> None:
+        message = event.message
+        with suppress(Exception):
+            self.db.set_cursor(event.chat_id, message.id)
         if self.state.is_paused:
             return
         self.state.incoming += 1
-        message = event.message
         if message.grouped_id:
             await self.collect_album(message, event.chat_id)
             return
@@ -75,10 +79,43 @@ class PipelineMixin:
         if messages:
             await self.enqueue(Job(messages=messages, source_chat_id=source_chat_id))
 
+    def bump_source(self, job: Job, field_name: str) -> None:
+        if job.target_channel == "test":
+            return
+        with suppress(Exception):
+            self.db.bump_source_stat(job.source_chat_id, field_name)
+
     async def enqueue(self, job: Job) -> None:
+        if job.job_id is None and job.target_channel is None:
+            try:
+                job.job_id = self.db.save_job(
+                    job.source_chat_id,
+                    [message.id for message in job.messages],
+                    attempts=job.attempts,
+                )
+                self.bump_source(job, "received")
+            except Exception as exc:
+                log(f"Не удалось сохранить задание в БД: {type(exc).__name__}: {exc}", logging.WARNING)
+        if job.job_id is not None and job.job_id in self._inflight_job_ids:
+            return
         try:
             self.queue.put_nowait(job)
+            if job.job_id is not None:
+                self._inflight_job_ids.add(job.job_id)
         except asyncio.QueueFull:
+            if job.job_id is not None:
+                first_overflow = not self._overflow_pending
+                self._overflow_pending = True
+                log(
+                    f"Очередь переполнена; задание {job.job_id} сохранено в БД и будет обработано позже",
+                    logging.WARNING,
+                )
+                if first_overflow:
+                    self.record_admin_error(f"Очередь переполнена: источник {job.source_chat_id}")
+                    await self.notify_admin(
+                        "⚠️ Очередь парсера переполнена. Новые задания сохранены и будут обработаны позже."
+                    )
+                return
             self.state.queue_dropped += 1
             self.state.errors += 1
             self.record_admin_error(f"Очередь переполнена: источник {job.source_chat_id}")
@@ -87,7 +124,92 @@ class PipelineMixin:
 
     async def requeue_later(self, job: Job, delay: int) -> None:
         await asyncio.sleep(delay)
+        job.retry_scheduled = False
+        if job.job_id is not None:
+            self._inflight_job_ids.discard(job.job_id)
         await self.enqueue(job)
+
+    async def restore_pending_jobs(self) -> int:
+        """Загружает сохранённые задания из БД в очередь (после рестарта или переполнения)."""
+        restored = 0
+        for row in self.db.load_pending_jobs(limit=self.queue.maxsize):
+            if row["job_id"] in self._inflight_job_ids:
+                continue
+            if self.queue.full():
+                self._overflow_pending = True
+                break
+            try:
+                fetched = await self.user_client.get_messages(
+                    row["source_chat_id"], ids=row["message_ids"]
+                )
+            except Exception as exc:
+                log(f"Не удалось восстановить задание {row['job_id']}: {type(exc).__name__}: {exc}", logging.WARNING)
+                continue
+            if not isinstance(fetched, list):
+                fetched = [fetched]
+            messages = [message for message in fetched if message]
+            if not messages:
+                self.db.delete_job(row["job_id"])
+                continue
+            job = Job(
+                messages=messages,
+                source_chat_id=row["source_chat_id"],
+                attempts=row["attempts"],
+                job_id=row["job_id"],
+            )
+            self.queue.put_nowait(job)
+            self._inflight_job_ids.add(row["job_id"])
+            restored += 1
+        self.state.recovered_jobs += restored
+        if restored:
+            log(f"Восстановлено заданий из БД: {restored}")
+        return restored
+
+    async def catch_up_sources(self) -> int:
+        """Подбирает посты, вышедшие в источниках, пока сервис был остановлен."""
+        max_messages = self.settings.catchup_max_messages
+        if max_messages <= 0:
+            return 0
+        cutoff = time.time() - self.settings.catchup_max_age_seconds
+        queued = 0
+        for chat_id in sorted(self.current_sources):
+            try:
+                cursor = self.db.get_cursor(chat_id)
+                if cursor is None:
+                    latest = await self.user_client.get_messages(chat_id, limit=1)
+                    if latest:
+                        self.db.set_cursor(chat_id, latest[0].id)
+                    continue
+                known_ids = self.db.pending_message_ids(chat_id)
+                collected = []
+                newest_id = cursor
+                async for message in self.user_client.iter_messages(
+                    chat_id, min_id=cursor, limit=max_messages
+                ):
+                    newest_id = max(newest_id, message.id)
+                    if message.date is not None and message.date.timestamp() < cutoff:
+                        break
+                    if message.id in known_ids:
+                        continue
+                    collected.append(message)
+                collected.reverse()
+                albums: dict[int, list] = {}
+                singles = []
+                for message in collected:
+                    if message.grouped_id:
+                        albums.setdefault(message.grouped_id, []).append(message)
+                    else:
+                        singles.append([message])
+                for messages in [*singles, *albums.values()]:
+                    await self.enqueue(Job(messages=messages, source_chat_id=chat_id))
+                    queued += 1
+                self.db.set_cursor(chat_id, newest_id)
+            except Exception as exc:
+                log(f"Догон источника {chat_id} не удался: {type(exc).__name__}: {exc}", logging.WARNING)
+        self.state.caught_up_posts += queued
+        if queued:
+            log(f"Догнано пропущенных постов: {queued}")
+        return queued
 
     def schedule_retry(self, job: Job, delay: int) -> None:
         task = asyncio.create_task(self.requeue_later(job, delay))
@@ -147,7 +269,7 @@ class PipelineMixin:
         if product.platform != "Ozon" or not self.ozon_discount_filter_enabled():
             return True
         discount = product.discount_percent
-        return discount is None or discount >= 30
+        return discount is None or discount >= thresholds.ozon_min_discount(self)
 
     def active_target_channel(self) -> str:
         return self.db.get_setting("publication_target", "main")
@@ -215,7 +337,7 @@ class PipelineMixin:
                 message_ids = json.loads(row["message_ids"])
                 if not message_ids:
                     raise RuntimeError("в базе отсутствуют ID сообщения для товара")
-                if (row["discount_percent"] or 0) > 50:
+                if (row["discount_percent"] or 0) > thresholds.unavailable_mark_discount(self):
                     publication_text = row["publication_text"]
                     link_offset = publication_text.find(product.canonical_url)
                     formatting_entities = []
@@ -254,7 +376,7 @@ class PipelineMixin:
                         row["published_at"] + POST_AUTO_DELETE_SECONDS,
                     )
                 else:
-                    self.db.defer_published_post_check(row["post_id"], now + 15 * 60)
+                    self.db.defer_published_post_check(row["post_id"], now + thresholds.recheck_delay_seconds(self))
                 if card is None:
                     log(
                         f"Проверка наличия {product.platform} {product.sku} не дала результата; "
@@ -262,7 +384,7 @@ class PipelineMixin:
                         logging.WARNING,
                     )
         except Exception as exc:
-            self.db.defer_published_post_check(row["post_id"], now + 15 * 60)
+            self.db.defer_published_post_check(row["post_id"], now + thresholds.recheck_delay_seconds(self))
             self.record_admin_error(
                 f"Проверка наличия {product.platform} {product.sku}: {type(exc).__name__}: {exc}"
             )
@@ -287,12 +409,12 @@ class PipelineMixin:
                 product.platform == "Wildberries"
                 and self.db.get_setting("wb_min_stock_filter", "true") == "true"
                 and card.total_quantity is not None
-                and card.total_quantity < 3
+                and card.total_quantity < thresholds.wb_min_stock(self)
             ):
                 self.db.release_reservations([product.sku_key])
                 log(
                     f"Отложенная публикация WB {product.sku} отменена: "
-                    f"остаток {card.total_quantity} (< 3)"
+                    f"остаток {card.total_quantity} (< {thresholds.wb_min_stock(self)})"
                 )
                 return
             if card.price_byn is None or card.price_byn <= 0:
@@ -318,7 +440,7 @@ class PipelineMixin:
                 self.db.release_reservations([product.sku_key])
                 log(
                     f"Отложенная публикация Ozon {product.sku} отменена: "
-                    f"скидка {discount:.1f}% (< 30%)"
+                    f"скидка {discount:.1f}% (< {thresholds.ozon_min_discount(self):g}%)"
                 )
                 return
 
@@ -335,7 +457,7 @@ class PipelineMixin:
                 self.state.last_published_at = time.time()
         except Exception as exc:
             attempts = row["attempts"] + 1
-            if attempts >= 20:
+            if attempts >= thresholds.scheduled_max_attempts(self):
                 self.db.release_reservations([product.sku_key])
                 self.record_admin_error(
                     f"Отложенная публикация {product.platform} {product.sku} прекращена "
@@ -343,10 +465,10 @@ class PipelineMixin:
                 )
                 await self.notify_admin(
                     f"⚠️ Отложенная публикация {product.platform} {product.sku} "
-                    "снята после 20 неудачных проверок."
+                    f"снята после {attempts} неудачных проверок."
                 )
             else:
-                self.db.reschedule_publication(product.sku_key, now + 15 * 60)
+                self.db.reschedule_publication(product.sku_key, now + thresholds.recheck_delay_seconds(self))
                 log(
                     f"Повтор проверки отложенной публикации {product.platform} {product.sku} "
                     f"через 15 минут: {type(exc).__name__}: {exc}",
@@ -501,6 +623,7 @@ class PipelineMixin:
         candidate_links = list(dict.fromkeys(url for url in raw_links if validate_marketplace_url(url)))
         if not candidate_links:
             self.state.rejected += 1
+            self.bump_source(job, "rejected")
             self.record_job_result(job, "отклонено: нет ссылок на маркетплейсы")
             return
 
@@ -592,6 +715,7 @@ class PipelineMixin:
 
         if not products:
             self.state.rejected += 1
+            self.bump_source(job, "rejected")
             self.record_job_result(job, "отклонено: товар не определён")
             return
 
@@ -607,6 +731,7 @@ class PipelineMixin:
         fresh_keys = self.db.reserve_fresh(products, job.source_chat_id, source_message_id)
         if not fresh_keys:
             self.state.duplicates += 1
+            self.bump_source(job, "duplicates")
             self.record_job_result(job, "дубликат")
             log(f"Все товары из сообщения {job.source_chat_id}/{source_message_id} уже обработаны")
             return
@@ -656,7 +781,17 @@ class PipelineMixin:
             return
 
         fresh_products = []
+        blocked_count = 0
         for product in available_products:
+            block_reason = self.db.find_block_match(product.brand, product.title)
+            if block_reason:
+                log(
+                    f"{product.platform} {product.sku}: публикация пропущена — "
+                    f"чёрный список ({block_reason})"
+                )
+                failed_keys.append(product.sku_key)
+                blocked_count += 1
+                continue
             if product.platform == "Ozon" and not self.passes_ozon_discount_filter(product):
                 discount = product.discount_percent
                 if discount is None:
@@ -669,7 +804,7 @@ class PipelineMixin:
                     continue
                 log(
                     f"Ozon {product.sku}: публикация пропущена — "
-                    f"скидка {discount:.1f}% меньше 30%"
+                    f"скидка {discount:.1f}% меньше {thresholds.ozon_min_discount(self):g}%"
                 )
                 failed_keys.append(product.sku_key)
                 continue
@@ -678,7 +813,11 @@ class PipelineMixin:
         if failed_keys:
             self.db.release_reservations(failed_keys)
         if not fresh_products:
-            self.record_job_result(job, "пропущено: фильтр остатков/скидки")
+            if blocked_count:
+                self.bump_source(job, "rejected")
+                self.record_job_result(job, "пропущено: чёрный список")
+            else:
+                self.record_job_result(job, "пропущено: фильтр остатков/скидки")
             return
 
         fresh_keys = {product.sku_key for product in fresh_products}
@@ -715,6 +854,10 @@ class PipelineMixin:
                 log(f"FloodWait на {exc.seconds} сек. Товары освобождены", logging.ERROR)
                 if job.attempts < MAX_FLOOD_RETRIES:
                     job.attempts += 1
+                    job.retry_scheduled = True
+                    if job.job_id is not None:
+                        with suppress(Exception):
+                            self.db.update_job_attempts(job.job_id, job.attempts)
                     self.schedule_retry(job, exc.seconds + 1)
                     await self.notify_admin(
                         f"⚠️ Telegram FloodWait: {exc.seconds} сек. "
@@ -739,6 +882,7 @@ class PipelineMixin:
             if was_published:
                 published_count += 1
                 self.state.published += 1
+                self.bump_source(job, "published")
                 self.state.last_published_at = time.time()
                 log(f"Опубликован товар {job.source_chat_id}/{source_message_id}: {product.sku_key}")
             else:
@@ -832,4 +976,12 @@ class PipelineMixin:
             finally:
                 if active:
                     self.state.active_jobs -= 1
+                if job.job_id is not None and not job.retry_scheduled:
+                    with suppress(Exception):
+                        self.db.delete_job(job.job_id)
+                    self._inflight_job_ids.discard(job.job_id)
                 self.queue.task_done()
+                if self._overflow_pending and not self.queue.full():
+                    self._overflow_pending = False
+                    with suppress(Exception):
+                        await self.restore_pending_jobs()

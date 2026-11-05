@@ -76,6 +76,18 @@ class Settings:
     data_dir: str = "data"
     timezone: str = "Europe/Minsk"
     test_channel: str = ""
+    ozon_min_discount_percent: float = 30.0
+    wb_min_stock: int = 3
+    unavailable_mark_discount_percent: float = 50.0
+    scheduled_max_attempts: int = 20
+    recheck_delay_seconds: int = 15 * 60
+    catchup_max_messages: int = 50
+    catchup_max_age_seconds: int = 6 * 3600
+    heartbeat_interval_seconds: int = 30
+
+    @property
+    def heartbeat_path(self) -> str:
+        return os.path.join(self.data_dir, "heartbeat")
 
     @property
     def user_session_path(self) -> str:
@@ -166,4 +178,14 @@ class Settings:
             include_source_notes=env_bool("INCLUDE_SOURCE_NOTES", default=False),
             timezone=timezone,
             test_channel=test_channel,
+            ozon_min_discount_percent=env_float("OZON_MIN_DISCOUNT_PERCENT", default=30.0, minimum=0),
+            wb_min_stock=env_int("WB_MIN_STOCK", default=3, minimum=0),
+            unavailable_mark_discount_percent=env_float(
+                "UNAVAILABLE_MARK_DISCOUNT_PERCENT", default=50.0, minimum=0
+            ),
+            scheduled_max_attempts=env_int("SCHEDULED_MAX_ATTEMPTS", default=20, minimum=1),
+            recheck_delay_seconds=env_int("RECHECK_DELAY_SECONDS", default=15 * 60, minimum=30),
+            catchup_max_messages=env_int("CATCHUP_MAX_MESSAGES", default=50, minimum=0),
+            catchup_max_age_seconds=env_int("CATCHUP_MAX_AGE_SECONDS", default=6 * 3600, minimum=0),
+            heartbeat_interval_seconds=env_int("HEARTBEAT_INTERVAL_SECONDS", default=30, minimum=5),
         )

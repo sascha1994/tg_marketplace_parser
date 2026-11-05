@@ -21,6 +21,7 @@ from urllib.parse import (
     urljoin,
     urlparse,
 )
+from . import thresholds
 from .common import (
     build_storefront_url,
     clean_product_title,
@@ -998,11 +999,11 @@ class MarketDataMixin:
             and product.platform == "Wildberries"
             and self.db.get_setting("wb_min_stock_filter", "true") == "true"
             and card.total_quantity is not None
-            and card.total_quantity < 3
+            and card.total_quantity < thresholds.wb_min_stock(self)
         ):
             log(
                 f"Товар Wildberries (арт. {product.sku}) отклонён: "
-                f"остаток {card.total_quantity}, требуется не менее 3"
+                f"остаток {card.total_quantity}, требуется не менее {thresholds.wb_min_stock(self)}"
             )
             return None
 

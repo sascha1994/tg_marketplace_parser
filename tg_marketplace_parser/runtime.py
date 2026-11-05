@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 from contextlib import suppress
 import logging
+import time
 from telethon.utils import get_peer_id
 from .common import (
     build_ssl_context,
@@ -12,6 +13,18 @@ from .optional_dependencies import CurlAsyncSession
 
 
 class RuntimeMixin:
+    def write_heartbeat(self) -> None:
+        """Обновляет файл heartbeat для проверки работоспособности контейнера."""
+        with suppress(OSError):
+            with open(self.settings.heartbeat_path, "w", encoding="utf-8") as handle:
+                handle.write(str(time.time()))
+
+    async def heartbeat_worker(self) -> None:
+        while True:
+            if self.user_client.is_connected() and self.bot_client.is_connected():
+                self.write_heartbeat()
+            await asyncio.sleep(self.settings.heartbeat_interval_seconds)
+
     async def run(self) -> None:
         timeout = aiohttp.ClientTimeout(
             total=self.settings.request_timeout_seconds,
@@ -82,6 +95,8 @@ class RuntimeMixin:
             self.channel_entities["main"] = self.target_entity
 
             await self.update_sources()
+            await self.restore_pending_jobs()
+            await self.catch_up_sources()
             self.workers = [
                 asyncio.create_task(self.process_worker(number), name=f"parser-worker-{number}")
                 for number in range(1, self.settings.worker_count + 1)
@@ -90,6 +105,7 @@ class RuntimeMixin:
                 self.scheduled_publication_worker(),
                 name="publication-scheduler",
             )
+            self.heartbeat_task = asyncio.create_task(self.heartbeat_worker(), name="heartbeat")
             await self.bot_client.send_message(
                 self.settings.admin_id,
                 "🟢 Парсер запущен и слушает источники.",
@@ -105,6 +121,7 @@ class RuntimeMixin:
                 *self.album_tasks.values(),
                 *self.retry_tasks,
                 *([self.publication_scheduler_task] if self.publication_scheduler_task else []),
+                *([self.heartbeat_task] if self.heartbeat_task else []),
             ]
             for task in pending:
                 task.cancel()

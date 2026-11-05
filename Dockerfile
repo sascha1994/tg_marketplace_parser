@@ -25,6 +25,16 @@ RUN apt-get update && \
 
 RUN playwright install chromium
 
-COPY . .
+# Непривилегированный пользователь; каталог данных должен быть доступен uid 1000
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin app && \
+    mkdir -p /app/data && \
+    chown -R app:app /app /ms-playwright
+
+COPY --chown=app:app . .
+
+USER app
+
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD ["python", "healthcheck.py"]
 
 CMD ["python", "parser.py"]
