@@ -1,8 +1,10 @@
 .env
 .env.*
 .git
+.gitignore
 .venv
 .idea
+.vscode
 .github
 tests
 data
@@ -12,3 +14,11 @@ __pycache__
 *.db-*
 *.session
 *.session-journal
+*.md
+*.png
+*.jpg
+*.jpeg
+pyproject.toml
+requirements-dev.txt
+docker-compose.yml
+Dockerfile
