@@ -1,6 +1,6 @@
 services:
   tg_deals_parser:
-    image: ghcr.io/sascha1994/tg_marketplace_parser:${PARSER_IMAGE_TAG:-latest}
+    image: ghcr.io/sascha1994/tg_marketplace_parser:${PARSER_IMAGE_TAG:-stable}
     container_name: tg_deals_parser
     restart: unless-stopped
     init: true
