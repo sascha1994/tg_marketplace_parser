@@ -295,6 +295,12 @@ class WildberriesMixin:
                             if card_data and card_data.title and card_data.price_byn is not None:
                                 return card_data
 
+        # Если API карточек успешно ответили (HTTP 200) и подтвердили отсутствие товара
+        if successful_api_responses >= 1 and explicit_oos_responses == successful_api_responses and (
+            card_data is None or card_data.price_byn is None
+        ):
+            return replace(card_data, in_stock=False, price_byn=None) if card_data else ProductCardData(in_stock=False)
+
         # 3. Пробуем поисковый API WB (search.wb.ru/exactmatch/ru/{shard}/v18/search и v9/search) по артикулу
         if card_data is None or card_data.price_byn is None:
             search_shards = ("common", "preset", "msk")
@@ -329,12 +335,6 @@ class WildberriesMixin:
                             card_data = merge_card_data(parsed_search, card_data)
                             if card_data and card_data.title and card_data.price_byn is not None:
                                 return card_data
-
-        # Если API карточек успешно ответили (HTTP 200) на нескольких регионах и везде подтвердили отсутствие товара
-        if successful_api_responses >= 2 and explicit_oos_responses == successful_api_responses and (
-            card_data is None or card_data.price_byn is None
-        ):
-            return replace(card_data, in_stock=False, price_byn=None) if card_data else ProductCardData(in_stock=False)
 
         # 4. Браузерный резолвер Playwright (обходит блокировку 403 на card.wb.ru и читает живой DOM карточки WB)
         if self.browser_resolver.is_available and (card_data is None or card_data.price_byn is None):
@@ -385,9 +385,18 @@ class WildberriesMixin:
                     return replace(merge_card_data(card_data, wp_card) or wp_card, in_stock=False, price_byn=None)
                 card_data = merge_card_data(card_data, wp_card)
 
-        # 6. Если живой эндпоинт цен закрыт антиботом (403), но карточка существует и не помечена как «нет в наличии»:
-        # используем последнюю известную цену из price-history.json или цену из текста поста
-        if card_data is not None and card_data.in_stock is not False and card_data.price_byn is None:
+        # 6. Если живой эндпоинт цен закрыт антиботом (403) при первичной обработке поста (есть source_text/messages),
+        # и карточка существует и не помечена как «нет в наличии»:
+        # используем последнюю известную цену из price-history.json или цену из текста поста.
+        # При фоновом мониторинге опубликованных постов (без source_text/messages) резервная цена не подставляется,
+        # чтобы не маскировать отсутствие товара или подорожание старой исторической ценой.
+        if (
+            (source_text or messages)
+            and explicit_oos_responses == 0
+            and card_data is not None
+            and card_data.in_stock is not False
+            and card_data.price_byn is None
+        ):
             fallback_price = latest_history_byn
             if fallback_price is None and source_text:
                 fallback_price = extract_price_from_post_text(source_text, rub_to_byn_rate=rub_rate)

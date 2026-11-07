@@ -271,6 +271,34 @@ class PipelineMixin:
         discount = product.discount_percent
         return discount is None or discount >= thresholds.ozon_min_discount(self)
 
+    def get_price_increase_percent(
+        self,
+        product: ProductInfo,
+        card: ProductCardData | None,
+    ) -> float | None:
+        if (
+            card is None
+            or card.price_byn is None
+            or card.price_byn <= 0
+            or product.price_byn is None
+            or product.price_byn <= 0
+        ):
+            return None
+        return round((card.price_byn - product.price_byn) * 100.0 / product.price_byn, 4)
+
+    def has_significant_price_increase(
+        self,
+        product: ProductInfo,
+        card: ProductCardData | None,
+    ) -> bool:
+        increase_pct = PipelineMixin.get_price_increase_percent(self, product, card)
+        max_increase = thresholds.max_price_increase_percent(self)
+        return (
+            increase_pct is not None
+            and max_increase > 0
+            and increase_pct >= max_increase
+        )
+
     def active_target_channel(self) -> str:
         return self.db.get_setting("publication_target", "main")
 
@@ -324,7 +352,7 @@ class PipelineMixin:
                 product,
                 text,
                 message_ids,
-                product.discount_percent if product.platform == "Ozon" else None,
+                product.discount_percent,
                 published_at,
                 target_channel=target_channel,
             )
@@ -333,11 +361,17 @@ class PipelineMixin:
     async def handle_published_post_check(self, row: dict, product: ProductInfo, card, now: int) -> None:
         try:
             target_entity = await self.get_channel_entity(row["target_channel"])
-            if card is not None and card.in_stock is False:
+            is_out_of_stock = card is not None and card.in_stock is False
+            increase_pct = PipelineMixin.get_price_increase_percent(self, product, card)
+            is_price_increased = PipelineMixin.has_significant_price_increase(self, product, card)
+            if is_out_of_stock or is_price_increased:
                 message_ids = json.loads(row["message_ids"])
                 if not message_ids:
                     raise RuntimeError("в базе отсутствуют ID сообщения для товара")
-                if (row["discount_percent"] or 0) > thresholds.unavailable_mark_discount(self):
+                discount_percent = row.get("discount_percent")
+                if discount_percent is None:
+                    discount_percent = product.discount_percent
+                if (discount_percent or 0) > thresholds.unavailable_mark_discount(self):
                     publication_text = row["publication_text"]
                     link_offset = publication_text.find(product.canonical_url)
                     formatting_entities = []
@@ -358,11 +392,23 @@ class PipelineMixin:
                     if len(message_ids) > 1:
                         await self.user_client.delete_messages(target_entity, message_ids[1:])
                     self.db.set_published_post_status(row["post_id"], "unavailable_marked")
-                    log(f"Пост {product.platform} {product.sku} помечен как неактуальный")
+                    if is_price_increased and increase_pct is not None and card is not None:
+                        log(
+                            f"Пост {product.platform} {product.sku} помечен как неактуальный: "
+                            f"цена выросла на {increase_pct:.1f}% ({product.price_byn} -> {card.price_byn} BYN)"
+                        )
+                    else:
+                        log(f"Пост {product.platform} {product.sku} помечен как неактуальный")
                 else:
                     await self.user_client.delete_messages(target_entity, message_ids)
                     self.db.set_published_post_status(row["post_id"], "deleted")
-                    log(f"Пост {product.platform} {product.sku} удалён: товара нет в наличии")
+                    if is_price_increased and increase_pct is not None and card is not None:
+                        log(
+                            f"Пост {product.platform} {product.sku} удалён: "
+                            f"цена выросла на {increase_pct:.1f}% ({product.price_byn} -> {card.price_byn} BYN)"
+                        )
+                    else:
+                        log(f"Пост {product.platform} {product.sku} удалён: товара нет в наличии")
             else:
                 if card is not None and card.in_stock is True:
                     interval = row.get(
@@ -419,19 +465,43 @@ class PipelineMixin:
                 return
             if card.price_byn is None or card.price_byn <= 0:
                 raise RuntimeError("не удалось подтвердить актуальную цену")
+            if PipelineMixin.has_significant_price_increase(self, product, card):
+                increase_pct = PipelineMixin.get_price_increase_percent(self, product, card) or 0.0
+                self.db.release_reservations([product.sku_key])
+                log(
+                    f"Отложенная публикация {product.platform} {product.sku} отменена: "
+                    f"цена выросла на {increase_pct:.1f}% ({product.price_byn} -> {card.price_byn} BYN)"
+                )
+                return
 
             refreshed = replace(
                 product,
                 title=card.title or product.title,
                 brand=card.brand or product.brand,
                 price_byn=card.price_byn,
-                avg_month_price_byn=card.avg_month_price_byn,
-                old_price_byn=card.old_price_byn,
+                avg_month_price_byn=(
+                    card.avg_month_price_byn
+                    if card.avg_month_price_byn is not None
+                    else product.avg_month_price_byn
+                ),
+                old_price_byn=(
+                    card.old_price_byn
+                    if card.old_price_byn is not None
+                    else product.old_price_byn
+                ),
                 image_url=card.image_url or product.image_url,
                 in_stock=card.in_stock is not False,
-                total_quantity=card.total_quantity,
-                rating=card.rating,
-                reviews_count=card.reviews_count,
+                total_quantity=(
+                    card.total_quantity
+                    if card.total_quantity is not None
+                    else product.total_quantity
+                ),
+                rating=card.rating if card.rating is not None else product.rating,
+                reviews_count=(
+                    card.reviews_count
+                    if card.reviews_count is not None
+                    else product.reviews_count
+                ),
             )
             if refreshed.platform == "Ozon" and not self.passes_ozon_discount_filter(refreshed):
                 discount = refreshed.discount_percent
@@ -535,6 +605,9 @@ class PipelineMixin:
 
                     row = scheduled[0]
                     product = ProductInfo(**json.loads(row["product_json"]))
+                    if product.platform == "Ozon" and time.time() - self._last_ozon_stock_check_at < 60 and wb_rows:
+                        row = wb_rows[0]
+                        product = ProductInfo(**json.loads(row["product_json"]))
                     if product.platform == "Ozon":
                         if time.time() - self._last_ozon_stock_check_at >= 60:
                             self._last_ozon_stock_check_at = time.time()
@@ -581,6 +654,9 @@ class PipelineMixin:
             if due_posts:
                 row = due_posts[0]
                 product = ProductInfo(**json.loads(row["product_json"]))
+                if product.platform == "Ozon" and time.time() - self._last_ozon_stock_check_at < 60 and due_wb_posts:
+                    row = due_wb_posts[0]
+                    product = ProductInfo(**json.loads(row["product_json"]))
                 is_ozon = product.platform == "Ozon"
                 if is_ozon and time.time() - self._last_ozon_stock_check_at < 60:
                     await asyncio.sleep(5)

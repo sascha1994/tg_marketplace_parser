@@ -964,9 +964,7 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
 
     if primary_has_live_offer or secondary_has_live_offer:
         in_stock: bool | None = True
-    elif primary.in_stock is False and secondary.in_stock is not True:
-        in_stock = False
-    elif secondary.in_stock is False and primary.in_stock is not True:
+    elif primary.in_stock is False or secondary.in_stock is False:
         in_stock = False
     elif primary.in_stock is True or secondary.in_stock is True:
         in_stock = True

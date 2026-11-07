@@ -6,7 +6,7 @@ from telethon import (
     events,
 )
 import time
-from . import thresholds
+from . import __version__, thresholds
 from .common import log
 from .common import validate_marketplace_url
 from .message_parsing import extract_links
@@ -38,10 +38,11 @@ class AdminMixin:
         wb_stock_filter = self.db.get_setting("wb_min_stock_filter", "true") == "true"
         ozon_min_disc = thresholds.ozon_min_discount(self)
         wb_min_stk = thresholds.wb_min_stock(self)
+        max_price_inc = thresholds.max_price_increase_percent(self)
         selected_target = self.db.get_setting("publication_target", "main")
         target_label = "тестовый" if selected_target == "test" else "основной"
         return (
-            "🤖 Панель управления парсером\n\n"
+            f"🤖 Панель управления парсером (v{__version__})\n\n"
             f"Статус: {status}{mode}\n"
             f"Очередь: {self.queue.qsize()}/{self.queue.maxsize}\n"
             f"Заданий в работе: {self.state.active_jobs}\n"
@@ -52,6 +53,7 @@ class AdminMixin:
             f"Перерыв публикаций: {quiet_start}–{quiet_end} ({self.settings.timezone})\n"
             f"Фильтр скидки Ozon ≥{ozon_min_disc:g}%: {'включён' if discount_filter else 'выключен'}\n"
             f"Фильтр остатков WB ≥{wb_min_stk}: {'включён' if wb_stock_filter else 'выключен'}\n"
+            f"Порог подорожания: ≥{max_price_inc:g}%\n"
             f"Аптайм: {hours}ч {minutes}м {seconds}с\n\n"
             f"🛡 Антибот и карточки:\n"
             f"• Браузер (Playwright): {browser_state}\n"
@@ -118,6 +120,7 @@ class AdminMixin:
                 Button.inline("🎯 Порог Ozon %", b"edit_ozon_discount_threshold"),
                 Button.inline("📦 Мин. остаток WB", b"edit_wb_stock_threshold"),
             ],
+            [Button.inline("📈 Порог роста цены %", b"edit_price_increase_threshold")],
             [
                 Button.inline("📈 Источники", b"source_stats"),
                 Button.inline("🧪 Каскад", b"cascade_stats"),
@@ -242,6 +245,7 @@ class AdminMixin:
         self.awaiting_schedule_input = False
         self.awaiting_ozon_discount_input = False
         self.awaiting_wb_stock_input = False
+        self.awaiting_price_increase_input = False
 
     def _register_admin_handlers(self) -> None:
         @self.bot_client.on(events.NewMessage(chats=self.settings.admin_id, pattern=r"^/start$"))
@@ -285,6 +289,18 @@ class AdminMixin:
                     await event.respond("Введите целое число от 1 до 1000 (например, 3).")
                     return
                 self.db.set_setting("wb_min_stock", str(num_int))
+                self._reset_admin_input_modes()
+                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                return
+            if getattr(self, "awaiting_price_increase_input", False):
+                try:
+                    num = float(value.replace(",", "."))
+                    if not (1 <= num <= 500):
+                        raise ValueError
+                except ValueError:
+                    await event.respond("Введите число от 1 до 500 (например, 15).")
+                    return
+                self.db.set_setting("max_price_increase_percent", f"{num:g}")
                 self._reset_admin_input_modes()
                 await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 return
@@ -385,6 +401,15 @@ class AdminMixin:
                 self.awaiting_wb_stock_input = True
                 await event.edit(
                     "Отправьте минимальный остаток WB (целое число от 1 до 1000), например: 3",
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
+            elif data == b"edit_price_increase_threshold":
+                self._reset_admin_input_modes()
+                self.awaiting_price_increase_input = True
+                await event.edit(
+                    "Отправьте порог подорожания в процентах для снятия неактуальных постов "
+                    "(от 1 до 500), например: 15",
                     buttons=[[Button.inline("↩️ В панель", b"refresh")]],
                 )
                 await event.answer()

@@ -121,7 +121,10 @@ class WildberriesBrowserMixin:
                     # Ожидаем отрисовки SPA-карточки WB или прохождения антибот-экрана
                     deadline = time.monotonic() + min(9.0, float(self.settings.browser_challenge_timeout))
                     while time.monotonic() < deadline:
-                        if intercepted_card and intercepted_card.price_byn is not None and intercepted_card.title:
+                        if intercepted_card and (
+                            (intercepted_card.price_byn is not None and intercepted_card.title)
+                            or intercepted_card.in_stock is False
+                        ):
                             break
                         ready = False
                         with suppress(Exception):
@@ -147,7 +150,9 @@ class WildberriesBrowserMixin:
                         await asyncio.sleep(0.55)
 
                     # Пробуем также in-page запрос к внутреннему эндпоинту WB из контекста вкладки, если цена ещё не перехвачена
-                    if intercepted_card is None or intercepted_card.price_byn is None:
+                    if intercepted_card is None or (
+                        intercepted_card.price_byn is None and intercepted_card.in_stock is not False
+                    ):
                         with suppress(Exception):
                             inpage_raw = await nav_page.evaluate(
                                 """async ({ sku, dest, spp }) => {
@@ -195,7 +200,7 @@ class WildberriesBrowserMixin:
                                     if (!el) return true;
                                     return Boolean(
                                         el.closest(
-                                            '.product-card, .j-card-item, .goods-card, .custom-slider, .swiper-wrapper .product-card, [class*="recommend"], [class*="similar"]'
+                                            'header, nav, footer, .header, .product-card, .j-card-item, .goods-card, .custom-slider, .swiper-wrapper .product-card, [class*="recommend"], [class*="similar"], [class*="carousel"]'
                                         )
                                     );
                                 };
@@ -247,7 +252,8 @@ class WildberriesBrowserMixin:
                                     '.sold-out-product',
                                     '.price-block__sold-out',
                                     '[class*="soldOutProduct"]',
-                                    '[class*="soldOut"]'
+                                    '[class*="soldOut"]',
+                                    '[class*="sold-out"]'
                                 ]);
 
                                 let hasAddToCart = false;
@@ -255,12 +261,12 @@ class WildberriesBrowserMixin:
                                     '.product-page .order__button',
                                     'button.order__button',
                                     '[class*="orderButton"]',
-                                    'button[aria-label*="корзин"]',
-                                    'button'
+                                    '.product-page button',
+                                    'main button'
                                 ];
                                 for (const sel of btnSelectors) {
                                     for (const b of document.querySelectorAll(sel)) {
-                                        if (isInsideCarousel(b)) continue;
+                                        if (isInsideCarousel(b) || b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
                                         const bt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
                                         if (bt.includes('в корзину') || bt.includes('добавить в корзину') || bt.includes('купить сейчас')) {
                                             hasAddToCart = true;
@@ -301,6 +307,16 @@ class WildberriesBrowserMixin:
                                     mainTxt.includes('страница не найдена') ||
                                     mainTxt.includes('ошибка 404')
                                 );
+                                const isSoldOutText = (
+                                    mainTxt.includes('нет в наличии') ||
+                                    mainTxt.includes('товара нет в наличии') ||
+                                    mainTxt.includes('товар продан') ||
+                                    mainTxt.includes('товар закончился') ||
+                                    mainTxt.includes('раскупили') ||
+                                    mainTxt.includes('нет на складе') ||
+                                    mainTxt.includes('снят с продажи') ||
+                                    mainTxt.includes('сообщить о поступлении')
+                                );
 
                                 return {
                                     title,
@@ -308,7 +324,7 @@ class WildberriesBrowserMixin:
                                     priceText: walletPrice || finalPrice,
                                     finalPriceText: finalPrice,
                                     oldPriceText: oldPrice,
-                                    soldOutText,
+                                    soldOutText: soldOutText || (isSoldOutText ? 'нет в наличии' : ''),
                                     hasAddToCart,
                                     imgSrc,
                                     ratingText,
@@ -357,10 +373,12 @@ class WildberriesBrowserMixin:
 
                         if p_byn is not None and p_byn > 0:
                             d_in_stock: bool | None = True
+                        elif d_sold_out and (
+                            any(m in d_sold_out for m in OUT_OF_STOCK_MARKERS) or not has_cart_btn
+                        ):
+                            d_in_stock = False
                         elif has_cart_btn:
                             d_in_stock = True
-                        elif d_sold_out and any(m in d_sold_out for m in OUT_OF_STOCK_MARKERS):
-                            d_in_stock = False
                         else:
                             d_in_stock = None
 
@@ -377,23 +395,22 @@ class WildberriesBrowserMixin:
                                 raw_currency=default_currency,
                             )
 
-                    html_content = await nav_page.content()
-                    html_card = parse_html_product_card(
-                        html_content,
-                        default_currency=default_currency,
-                        rub_to_byn_rate=rub_to_byn_rate,
-                    )
+                    combined = merge_card_data(intercepted_card, dom_card)
+                    if combined is None or (combined.in_stock is None and combined.price_byn is None):
+                        html_content = await nav_page.content()
+                        html_card = parse_html_product_card(
+                            html_content,
+                            default_currency=default_currency,
+                            rub_to_byn_rate=rub_to_byn_rate,
+                        )
+                        combined = merge_card_data(combined, html_card)
 
                     extras_card = ProductCardData(
                         title=intercepted_basket_title,
                         brand=intercepted_basket_brand,
-                        price_byn=intercepted_latest_byn if (intercepted_card is None or intercepted_card.price_byn is None) else None,
                         avg_month_price_byn=intercepted_avg_byn,
                         image_url=intercepted_img_url,
                     )
-
-                    combined = merge_card_data(intercepted_card, dom_card)
-                    combined = merge_card_data(combined, html_card)
                     combined = merge_card_data(combined, extras_card)
 
                     if combined and (

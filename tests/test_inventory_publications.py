@@ -797,6 +797,194 @@ class PersistenceAndSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertEqual(downloader.curl_session.get.await_count, 2)
 
+    async def test_wb_high_discount_post_is_marked_unavailable_and_saves_discount(self):
+        product = make_product(
+            "Wildberries",
+            sku="wb-high",
+            price_byn=40.0,
+            avg_month_price_byn=100.0,
+        )
+        publication_text = f"🟪 Wildberries\n\n🔗 {product.canonical_url}"
+        self.db.reserve_fresh([product], 1, 2)
+        self.db.save_published_post(
+            product,
+            publication_text,
+            [70],
+            product.discount_percent,
+            published_at=1000,
+        )
+        row = self.db.get_due_published_posts(1900)[0]
+        self.assertEqual(row["discount_percent"], 60.0)
+        client = SimpleNamespace(edit_message=AsyncMock(), delete_messages=AsyncMock())
+        parser = SimpleNamespace(
+            target_entity="target",
+            user_client=client,
+            db=self.db,
+            record_admin_error=lambda message: None,
+        )
+        parser.get_channel_entity = AsyncMock(return_value="target")
+
+        await PipelineMixin.handle_published_post_check(
+            parser,
+            row,
+            product,
+            ProductCardData(in_stock=False),
+            1900,
+        )
+
+        client.edit_message.assert_awaited_once()
+        edited_text = client.edit_message.await_args.args[2]
+        self.assertTrue(edited_text.endswith("❌ Неактуально"))
+        status = self.db._conn.execute(
+            "SELECT status FROM published_posts WHERE post_id = ?",
+            ("main:70",),
+        ).fetchone()
+        self.assertEqual(status[0], "unavailable_marked")
+
+    async def test_wb_legacy_post_without_saved_discount_uses_product_discount(self):
+        product = make_product(
+            "Wildberries",
+            sku="wb-legacy",
+            price_byn=35.0,
+            avg_month_price_byn=100.0,
+        )
+        publication_text = f"🟪 Wildberries\n\n🔗 {product.canonical_url}"
+        self.db.reserve_fresh([product], 1, 2)
+        self.db.save_published_post(product, publication_text, [71], None, published_at=1000)
+        row = self.db.get_due_published_posts(1900)[0]
+        client = SimpleNamespace(edit_message=AsyncMock(), delete_messages=AsyncMock())
+        parser = SimpleNamespace(
+            target_entity="target",
+            user_client=client,
+            db=self.db,
+            record_admin_error=lambda message: None,
+        )
+        parser.get_channel_entity = AsyncMock(return_value="target")
+
+        await PipelineMixin.handle_published_post_check(
+            parser,
+            row,
+            product,
+            ProductCardData(in_stock=False),
+            1900,
+        )
+
+        client.edit_message.assert_awaited_once()
+        status = self.db._conn.execute(
+            "SELECT status FROM published_posts WHERE post_id = ?",
+            ("main:71",),
+        ).fetchone()
+        self.assertEqual(status[0], "unavailable_marked")
+
+    async def test_significant_price_increase_marks_or_deletes_post(self):
+        high_disc_product = make_product(
+            "Wildberries",
+            sku="wb-price-up-high",
+            price_byn=40.0,
+            avg_month_price_byn=100.0,
+        )
+        low_disc_product = make_product(
+            "Ozon",
+            sku="oz-price-up-low",
+            price_byn=60.0,
+            avg_month_price_byn=100.0,
+        )
+        minor_up_product = make_product(
+            "Wildberries",
+            sku="wb-price-up-minor",
+            price_byn=40.0,
+            avg_month_price_byn=100.0,
+        )
+        self.db.reserve_fresh([high_disc_product, low_disc_product, minor_up_product], 1, 2)
+        self.db.save_published_post(
+            high_disc_product,
+            f"🟪 Wildberries\n\n🔗 {high_disc_product.canonical_url}",
+            [80],
+            high_disc_product.discount_percent,
+            published_at=1000,
+        )
+        self.db.save_published_post(
+            low_disc_product,
+            f"🔷 Ozon\n\n🔗 {low_disc_product.canonical_url}",
+            [81],
+            low_disc_product.discount_percent,
+            published_at=1000,
+        )
+        self.db.save_published_post(
+            minor_up_product,
+            f"🟪 Wildberries\n\n🔗 {minor_up_product.canonical_url}",
+            [82],
+            minor_up_product.discount_percent,
+            published_at=1000,
+        )
+
+        due = {row["post_id"]: row for row in self.db.get_due_published_posts(1900, limit=10)}
+        client = SimpleNamespace(edit_message=AsyncMock(), delete_messages=AsyncMock())
+        parser = SimpleNamespace(
+            target_entity="target",
+            user_client=client,
+            db=self.db,
+            record_admin_error=lambda message: None,
+        )
+        parser.get_channel_entity = AsyncMock(return_value="target")
+
+        # +15% (40 -> 46 BYN) при скидке 60% -> помечается "❌ Неактуально"
+        await PipelineMixin.handle_published_post_check(
+            parser,
+            due["main:80"],
+            high_disc_product,
+            ProductCardData(in_stock=True, price_byn=46.0),
+            1900,
+        )
+        client.edit_message.assert_awaited_once()
+        self.assertTrue(client.edit_message.await_args.args[2].endswith("❌ Неактуально"))
+
+        # +20% (60 -> 72 BYN) при скидке 40% -> удаляется
+        await PipelineMixin.handle_published_post_check(
+            parser,
+            due["main:81"],
+            low_disc_product,
+            ProductCardData(in_stock=True, price_byn=72.0),
+            1900,
+        )
+        client.delete_messages.assert_awaited_once_with("target", [81])
+
+        # +10% (40 -> 44 BYN) < 15% -> остаётся активным
+        await PipelineMixin.handle_published_post_check(
+            parser,
+            due["main:82"],
+            minor_up_product,
+            ProductCardData(in_stock=True, price_byn=44.0),
+            1900,
+        )
+        statuses = dict(
+            self.db._conn.execute(
+                "SELECT post_id, status FROM published_posts WHERE post_id IN ('main:80', 'main:81', 'main:82')"
+            ).fetchall()
+        )
+        self.assertEqual(statuses["main:80"], "unavailable_marked")
+        self.assertEqual(statuses["main:81"], "deleted")
+        self.assertEqual(statuses["main:82"], "active")
+
+    async def test_wb_card_background_check_does_not_use_history_price_as_in_stock(self):
+        class FakeWbChecker(MarketDataMixin):
+            settings = SimpleNamespace(wb_dest_byn=-59208, wb_spp=30)
+            state = SimpleNamespace(cascade_stats={})
+            browser_resolver = SimpleNamespace(is_available=False)
+            user_client = SimpleNamespace(is_connected=lambda: False)
+            get_rub_to_byn_rate = AsyncMock(return_value=0.0345)
+            _fetch_wb_basket_card_extras = AsyncMock(
+                return_value=("Куртка", "Brand", 100.0, 50.0, "https://img", 4.8, 10, True)
+            )
+            _fetch_json_url = AsyncMock(return_value={"_http_status": 403})
+
+        checker = FakeWbChecker()
+        # Без source_text/messages (фоновая проверка опубликованного поста)
+        card = await checker.fetch_wb_card_data("12345")
+        self.assertIsNotNone(card)
+        self.assertIsNone(card.in_stock)
+        self.assertIsNone(card.price_byn)
+
 
 if __name__ == "__main__":
     unittest.main()
