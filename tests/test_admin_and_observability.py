@@ -306,6 +306,16 @@ class AdminAndObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.db.set_setting("ozon_check_interval_seconds", "25")
         self.assertEqual(thresholds.unavailable_mark_discount(admin), 65.0)
         self.assertEqual(thresholds.ozon_check_interval_seconds(admin), 25)
+        admin.current_sources = {1, 2}
+        self.assertIn("Фильтр скидки Ozon", admin.get_filters_text())
+        self.assertIn("Расписание публикаций", admin.get_schedule_text())
+        self.assertIn("65%", admin.get_thresholds_text())
+        self.assertIn("Мониторинг и диагностика", admin.get_monitoring_text())
+        self.assertIn("Сервисное управление", admin.get_service_text())
+        self.assertEqual(len(admin.get_admin_keyboard()), 5)
+        self.assertEqual(len(admin.get_thresholds_keyboard()), 4)
+        self.assertEqual(len(admin.get_monitoring_keyboard()), 3)
+        self.assertEqual(len(admin.get_service_keyboard()), 3)
 
     async def test_run_scheduled_publication_step_switches_to_wb_when_ozon_throttled(self):
         import time as time_mod

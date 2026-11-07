@@ -91,29 +91,6 @@ class AdminMixin:
             if self.state.is_paused
             else Button.inline("⏸ Пауза", b"pause")
         )
-        ozon_min_disc = thresholds.ozon_min_discount(self)
-        wb_min_stk = thresholds.wb_min_stock(self)
-        discount_label = (
-            f"✅ Фильтр Ozon ≥{ozon_min_disc:g}%: ВКЛ"
-            if self.db.get_setting("ozon_discount_filter", "true") == "true"
-            else f"⏸ Фильтр Ozon ≥{ozon_min_disc:g}%: ВЫКЛ"
-        )
-        quiet_hours_label = (
-            "✅ Перерыв по времени: ВКЛ"
-            if self.db.get_setting("quiet_hours_enabled", "true") == "true"
-            else "⏸ Перерыв по времени: ВЫКЛ"
-        )
-        wb_stock_filter_label = (
-            f"✅ Остаток WB ≥{wb_min_stk}: ВКЛ"
-            if self.db.get_setting("wb_min_stock_filter", "true") == "true"
-            else f"⏸ Остаток WB ≥{wb_min_stk}: ВЫКЛ"
-        )
-        wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
-        wb_fallback_label = (
-            "✅ Резерв цены WB: ВКЛ"
-            if self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
-            else "⏸ Резерв цены WB: ВЫКЛ"
-        )
         selected_target = self.db.get_setting("publication_target", "main")
         target_buttons = [
             Button.inline(
@@ -129,31 +106,166 @@ class AdminMixin:
                 )
             )
         return [
-            [Button.inline("📊 Обновить статус", b"refresh"), pause_button],
+            [Button.inline("📊 Обновить", b"refresh"), pause_button],
             target_buttons,
-            [Button.inline(quiet_hours_label, b"toggle_quiet_hours")],
-            [Button.inline("⏰ Настроить интервал перерыва", b"edit_schedule")],
-            [Button.inline(discount_label, b"toggle_ozon_discount")],
-            [Button.inline(wb_stock_filter_label, b"toggle_wb_stock_filter")],
+            [
+                Button.inline("⚙️ Фильтры", b"menu_filters"),
+                Button.inline("⏰ Расписание", b"menu_schedule"),
+            ],
+            [
+                Button.inline("🎯 Пороги", b"menu_thresholds"),
+                Button.inline("📈 Мониторинг", b"menu_monitoring"),
+            ],
+            [Button.inline("🛠 Сервис", b"menu_service")],
+        ]
+
+    def get_filters_text(self) -> str:
+        ozon_min_disc = thresholds.ozon_min_discount(self)
+        wb_min_stk = thresholds.wb_min_stock(self)
+        discount_filter = self.db.get_setting("ozon_discount_filter", "true") == "true"
+        wb_stock_filter = self.db.get_setting("wb_min_stock_filter", "true") == "true"
+        wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
+        wb_fallback_enabled = self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
+        return (
+            "⚙️ Настройки фильтров:\n\n"
+            f"• Фильтр скидки Ozon (≥{ozon_min_disc:g}%): {'✅ включён' if discount_filter else '⏸ выключен'}\n"
+            f"• Фильтр остатка WB (≥{wb_min_stk} шт.): {'✅ включён' if wb_stock_filter else '⏸ выключен'}\n"
+            f"• Резерв цены WB (история/текст при 403): {'✅ включён' if wb_fallback_enabled else '⏸ выключен'}"
+        )
+
+    def get_filters_keyboard(self):
+        ozon_min_disc = thresholds.ozon_min_discount(self)
+        wb_min_stk = thresholds.wb_min_stock(self)
+        discount_label = (
+            f"✅ Ozon ≥{ozon_min_disc:g}%: ВКЛ"
+            if self.db.get_setting("ozon_discount_filter", "true") == "true"
+            else f"⏸ Ozon ≥{ozon_min_disc:g}%: ВЫКЛ"
+        )
+        wb_stock_filter_label = (
+            f"✅ Остаток WB ≥{wb_min_stk}: ВКЛ"
+            if self.db.get_setting("wb_min_stock_filter", "true") == "true"
+            else f"⏸ Остаток WB ≥{wb_min_stk}: ВЫКЛ"
+        )
+        wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
+        wb_fallback_label = (
+            "✅ Резерв цены WB: ВКЛ"
+            if self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
+            else "⏸ Резерв цены WB: ВЫКЛ"
+        )
+        return [
+            [
+                Button.inline(discount_label, b"toggle_ozon_discount"),
+                Button.inline("✏️ %", b"edit_ozon_discount_threshold"),
+            ],
+            [
+                Button.inline(wb_stock_filter_label, b"toggle_wb_stock_filter"),
+                Button.inline("✏️ шт.", b"edit_wb_stock_threshold"),
+            ],
             [Button.inline(wb_fallback_label, b"toggle_wb_fallback_price")],
+            [Button.inline("↩️ Назад в панель", b"refresh")],
+        ]
+
+    def get_schedule_text(self) -> str:
+        quiet_start = self.db.get_setting("quiet_hours_start", "01:30")
+        quiet_end = self.db.get_setting("quiet_hours_end", "07:00")
+        quiet_hours_enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
+        return (
+            "⏰ Расписание публикаций:\n\n"
+            f"• Ограничение по времени: {'✅ включено' if quiet_hours_enabled else '⏸ выключено'}\n"
+            f"• Тихие часы: {quiet_start}–{quiet_end} ({self.settings.timezone})"
+        )
+
+    def get_schedule_keyboard(self):
+        quiet_start = self.db.get_setting("quiet_hours_start", "01:30")
+        quiet_end = self.db.get_setting("quiet_hours_end", "07:00")
+        quiet_hours_label = (
+            "✅ Перерыв по времени: ВКЛ"
+            if self.db.get_setting("quiet_hours_enabled", "true") == "true"
+            else "⏸ Перерыв по времени: ВЫКЛ"
+        )
+        return [
+            [Button.inline(quiet_hours_label, b"toggle_quiet_hours")],
+            [Button.inline(f"✏️ Изменить интервал ({quiet_start}–{quiet_end})", b"edit_schedule")],
+            [Button.inline("↩️ Назад в панель", b"refresh")],
+        ]
+
+    def get_thresholds_text(self) -> str:
+        ozon_min_disc = thresholds.ozon_min_discount(self)
+        wb_min_stk = thresholds.wb_min_stock(self)
+        max_price_inc = thresholds.max_price_increase_percent(self)
+        unavail_disc = thresholds.unavailable_mark_discount(self)
+        ozon_check_int = thresholds.ozon_check_interval_seconds(self)
+        return (
+            "🎯 Пороговые значения и интервалы:\n\n"
+            f"• Мин. скидка Ozon: ≥{ozon_min_disc:g}%\n"
+            f"• Мин. остаток WB: ≥{wb_min_stk} шт.\n"
+            f"• Порог роста цены (снятие поста): ≥{max_price_inc:g}%\n"
+            f"• Порог пометки «❌ Неактуально» (вместо удаления): >{unavail_disc:g}%\n"
+            f"• Интервал между проверками Ozon: {ozon_check_int} сек."
+        )
+
+    def get_thresholds_keyboard(self):
+        ozon_min_disc = thresholds.ozon_min_discount(self)
+        wb_min_stk = thresholds.wb_min_stock(self)
+        max_price_inc = thresholds.max_price_increase_percent(self)
+        unavail_disc = thresholds.unavailable_mark_discount(self)
+        ozon_check_int = thresholds.ozon_check_interval_seconds(self)
+        return [
             [
-                Button.inline("🎯 Порог Ozon %", b"edit_ozon_discount_threshold"),
-                Button.inline("📦 Мин. остаток WB", b"edit_wb_stock_threshold"),
+                Button.inline(f"🎯 Ozon ≥{ozon_min_disc:g}%", b"edit_ozon_discount_threshold"),
+                Button.inline(f"📦 WB ≥{wb_min_stk} шт.", b"edit_wb_stock_threshold"),
             ],
             [
-                Button.inline("📈 Порог роста цены %", b"edit_price_increase_threshold"),
-                Button.inline("🏷 Порог «Неактуально» %", b"edit_unavailable_discount_threshold"),
+                Button.inline(f"📈 Рост ≥{max_price_inc:g}%", b"edit_price_increase_threshold"),
+                Button.inline(f"🏷 Пометка >{unavail_disc:g}%", b"edit_unavailable_discount_threshold"),
             ],
-            [Button.inline("⏱ Интервал проверок Ozon (с)", b"edit_ozon_check_interval")],
+            [Button.inline(f"⏱ Интервал Ozon: {ozon_check_int}с", b"edit_ozon_check_interval")],
+            [Button.inline("↩️ Назад в панель", b"refresh")],
+        ]
+
+    def get_monitoring_text(self) -> str:
+        active_posts, due_posts = (
+            self.db.count_published_post_checks()
+            if hasattr(self.db, "count_published_post_checks")
+            else (0, 0)
+        )
+        return (
+            "📈 Мониторинг и диагностика:\n\n"
+            f"• Активных постов на проверке: {active_posts} (ожидают сейчас: {due_posts})\n"
+            f"• Обработано карточек: {self.state.cards_parsed}\n"
+            f"• Ошибок с момента запуска: {self.state.errors}"
+        )
+
+    def get_monitoring_keyboard(self):
+        return [
             [
                 Button.inline("📈 Источники", b"source_stats"),
                 Button.inline("🧪 Каскад", b"cascade_stats"),
-                Button.inline("🚫 Блок-лист", b"blocklist_view"),
             ],
-            [Button.inline("📜 Последняя обработка", b"recent_jobs")],
-            [Button.inline("⚠️ Последние ошибки", b"recent_errors")],
-            [Button.inline("🔄 Обновить источники", b"reload_sources")],
+            [
+                Button.inline("📜 Последняя обработка", b"recent_jobs"),
+                Button.inline("⚠️ Ошибки", b"recent_errors"),
+            ],
+            [Button.inline("↩️ Назад в панель", b"refresh")],
+        ]
+
+    def get_service_text(self) -> str:
+        published_db, pending_db = self.db.count_by_status()
+        return (
+            "🛠 Сервисное управление:\n\n"
+            f"• Подключено источников: {len(self.current_sources)}\n"
+            f"• Правил в чёрном списке: {len(self.db.list_blocks())}\n"
+            f"• Записей дедупликации в БД: опубликовано {published_db}, pending {pending_db}"
+        )
+
+    def get_service_keyboard(self):
+        return [
+            [
+                Button.inline("🚫 Блок-лист", b"blocklist_view"),
+                Button.inline("🔄 Обновить источники", b"reload_sources"),
+            ],
             [Button.inline("🧹 Очистить дедупликацию", b"clear_db_confirm")],
+            [Button.inline("↩️ Назад в панель", b"refresh")],
         ]
 
     def get_recent_jobs_text(self) -> str:
@@ -288,7 +400,10 @@ class AdminMixin:
             value = (event.raw_text or "").strip()
             block_reply = self.handle_admin_block_command(value)
             if block_reply is not None:
-                await event.respond(block_reply, buttons=[[Button.inline("↩️ В панель", b"refresh")]])
+                await event.respond(
+                    block_reply,
+                    buttons=[[Button.inline("↩️ К сервису", b"menu_service"), Button.inline("🏠 В панель", b"refresh")]],
+                )
                 return
             if await self.enqueue_admin_test_message(event):
                 return
@@ -304,7 +419,7 @@ class AdminMixin:
                     return
                 self.db.set_setting("ozon_min_discount_percent", f"{num:g}")
                 self._reset_admin_input_modes()
-                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.respond(self.get_thresholds_text(), buttons=self.get_thresholds_keyboard())
                 return
             if getattr(self, "awaiting_wb_stock_input", False):
                 try:
@@ -316,7 +431,7 @@ class AdminMixin:
                     return
                 self.db.set_setting("wb_min_stock", str(num_int))
                 self._reset_admin_input_modes()
-                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.respond(self.get_thresholds_text(), buttons=self.get_thresholds_keyboard())
                 return
             if getattr(self, "awaiting_price_increase_input", False):
                 try:
@@ -328,7 +443,7 @@ class AdminMixin:
                     return
                 self.db.set_setting("max_price_increase_percent", f"{num:g}")
                 self._reset_admin_input_modes()
-                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.respond(self.get_thresholds_text(), buttons=self.get_thresholds_keyboard())
                 return
             if getattr(self, "awaiting_unavailable_discount_input", False):
                 try:
@@ -340,7 +455,7 @@ class AdminMixin:
                     return
                 self.db.set_setting("unavailable_mark_discount_percent", f"{num:g}")
                 self._reset_admin_input_modes()
-                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.respond(self.get_thresholds_text(), buttons=self.get_thresholds_keyboard())
                 return
             if getattr(self, "awaiting_ozon_interval_input", False):
                 try:
@@ -352,7 +467,7 @@ class AdminMixin:
                     return
                 self.db.set_setting("ozon_check_interval_seconds", str(num_int))
                 self._reset_admin_input_modes()
-                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.respond(self.get_thresholds_text(), buttons=self.get_thresholds_keyboard())
                 return
             if not self.awaiting_schedule_input:
                 return
@@ -379,7 +494,7 @@ class AdminMixin:
             self.db.set_setting("quiet_hours_start", start_value)
             self.db.set_setting("quiet_hours_end", end_value)
             self._reset_admin_input_modes()
-            await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+            await event.respond(self.get_schedule_text(), buttons=self.get_schedule_keyboard())
 
         @self.bot_client.on(events.CallbackQuery(chats=self.settings.admin_id))
         async def admin_callback(event):
@@ -391,34 +506,54 @@ class AdminMixin:
                 self._reset_admin_input_modes()
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Данные обновлены")
+            elif data == b"menu_filters":
+                self._reset_admin_input_modes()
+                await event.edit(self.get_filters_text(), buttons=self.get_filters_keyboard())
+                await event.answer()
+            elif data == b"menu_schedule":
+                self._reset_admin_input_modes()
+                await event.edit(self.get_schedule_text(), buttons=self.get_schedule_keyboard())
+                await event.answer()
+            elif data == b"menu_thresholds":
+                self._reset_admin_input_modes()
+                await event.edit(self.get_thresholds_text(), buttons=self.get_thresholds_keyboard())
+                await event.answer()
+            elif data == b"menu_monitoring":
+                self._reset_admin_input_modes()
+                await event.edit(self.get_monitoring_text(), buttons=self.get_monitoring_keyboard())
+                await event.answer()
+            elif data == b"menu_service":
+                self._reset_admin_input_modes()
+                await event.edit(self.get_service_text(), buttons=self.get_service_keyboard())
+                await event.answer()
             elif data == b"recent_jobs":
                 await event.edit(
                     self.get_recent_jobs_text(),
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_monitoring"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"recent_errors":
                 await event.edit(
                     self.get_recent_errors_text(),
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_monitoring"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"source_stats":
                 await event.edit(
                     self.get_source_stats_text(),
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_monitoring"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"cascade_stats":
                 await event.edit(
                     self.get_cascade_stats_text(),
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_monitoring"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"blocklist_view":
                 await event.edit(
                     self.get_blocklist_text(),
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_service"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"pause":
@@ -435,7 +570,7 @@ class AdminMixin:
                 await event.edit(
                     "Отправьте интервал запрета публикаций в формате ЧЧ:ММ-ЧЧ:ММ "
                     f"(временная зона {self.settings.timezone}). Например: 01:30-07:00.",
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_schedule"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"edit_ozon_discount_threshold":
@@ -443,7 +578,7 @@ class AdminMixin:
                 self.awaiting_ozon_discount_input = True
                 await event.edit(
                     "Отправьте минимальный процент скидки Ozon (от 1 до 95), например: 30",
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_thresholds"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"edit_wb_stock_threshold":
@@ -451,7 +586,7 @@ class AdminMixin:
                 self.awaiting_wb_stock_input = True
                 await event.edit(
                     "Отправьте минимальный остаток WB (целое число от 1 до 1000), например: 3",
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_thresholds"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"edit_price_increase_threshold":
@@ -460,7 +595,7 @@ class AdminMixin:
                 await event.edit(
                     "Отправьте порог подорожания в процентах для снятия неактуальных постов "
                     "(от 1 до 500), например: 15",
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_thresholds"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"edit_unavailable_discount_threshold":
@@ -469,7 +604,7 @@ class AdminMixin:
                 await event.edit(
                     "Отправьте порог скидки (%) для пометки поста «❌ Неактуально» вместо удаления "
                     "(от 0 до 99), например: 50",
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_thresholds"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"edit_ozon_check_interval":
@@ -478,13 +613,13 @@ class AdminMixin:
                 await event.edit(
                     "Отправьте минимальный интервал между проверками карточек Ozon в секундах "
                     "(от 5 до 3600), например: 30",
-                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                    buttons=[[Button.inline("↩️ Назад", b"menu_thresholds"), Button.inline("🏠 В панель", b"refresh")]],
                 )
                 await event.answer()
             elif data == b"toggle_quiet_hours":
                 enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
                 self.db.set_setting("quiet_hours_enabled", "false" if enabled else "true")
-                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.edit(self.get_schedule_text(), buttons=self.get_schedule_keyboard())
                 await event.answer(
                     "Ограничение по времени включено"
                     if not enabled
@@ -493,18 +628,18 @@ class AdminMixin:
             elif data == b"toggle_ozon_discount":
                 enabled = self.db.get_setting("ozon_discount_filter", "true") == "true"
                 self.db.set_setting("ozon_discount_filter", "false" if enabled else "true")
-                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.edit(self.get_filters_text(), buttons=self.get_filters_keyboard())
                 await event.answer("Фильтр скидки Ozon обновлён")
             elif data == b"toggle_wb_stock_filter":
                 enabled = self.db.get_setting("wb_min_stock_filter", "true") == "true"
                 self.db.set_setting("wb_min_stock_filter", "false" if enabled else "true")
-                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.edit(self.get_filters_text(), buttons=self.get_filters_keyboard())
                 await event.answer("Фильтр минимального остатка WB обновлён")
             elif data == b"toggle_wb_fallback_price":
                 wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
                 enabled = self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
                 self.db.set_setting("wb_allow_fallback_price", "false" if enabled else "true")
-                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.edit(self.get_filters_text(), buttons=self.get_filters_keyboard())
                 await event.answer("Настройка резервной цены WB обновлена")
             elif data == b"select_main_channel":
                 self.db.set_setting("publication_target", "main")
@@ -519,7 +654,7 @@ class AdminMixin:
                 await event.answer("Выбран тестовый канал")
             elif data == b"reload_sources":
                 await self.update_sources()
-                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.edit(self.get_service_text(), buttons=self.get_service_keyboard())
                 await event.answer("Источники обновлены")
             elif data == b"clear_db_confirm":
                 await event.edit(
@@ -527,11 +662,11 @@ class AdminMixin:
                     "После этого старые товары могут быть опубликованы повторно.",
                     buttons=[
                         [Button.inline("✅ Да, удалить", b"clear_db_execute")],
-                        [Button.inline("↩️ Отмена", b"refresh")],
+                        [Button.inline("↩️ Отмена", b"menu_service")],
                     ],
                 )
             elif data == b"clear_db_execute":
                 self.db.clear_published()
-                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.edit(self.get_service_text(), buttons=self.get_service_keyboard())
                 await event.answer("База дедупликации очищена")
                 log("Администратор очистил БД дедупликации", logging.WARNING)

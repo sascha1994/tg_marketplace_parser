@@ -359,10 +359,12 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        keyboard = AdminMixin.get_admin_keyboard(admin)
+        main_keyboard = AdminMixin.get_admin_keyboard(admin)
+        self.assertEqual(len(main_keyboard), 5)
+        schedule_keyboard = AdminMixin.get_schedule_keyboard(admin)
         button = next(
             button
-            for row in keyboard
+            for row in schedule_keyboard
             for button in row
             if button.type.data == b"toggle_quiet_hours"
         )
@@ -379,10 +381,10 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        keyboard = AdminMixin.get_admin_keyboard(admin)
+        filters_keyboard = AdminMixin.get_filters_keyboard(admin)
         button = next(
             button
-            for row in keyboard
+            for row in filters_keyboard
             for button in row
             if button.type.data == b"toggle_wb_stock_filter"
         )
