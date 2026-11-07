@@ -15,6 +15,7 @@ class ProductCardData:
     rating: float | None = None
     reviews_count: int | None = None
     raw_currency: str = "BYN"
+    price_source: str = "live"
 
 @dataclass(frozen=True)
 class ProductInfo:
@@ -34,6 +35,7 @@ class ProductInfo:
     total_quantity: int | None = None
     rating: float | None = None
     reviews_count: int | None = None
+    price_source: str = "live"
 
     @property
     def display_title(self) -> str:

@@ -19,6 +19,11 @@ class AdminMixin:
         hours, remainder = divmod(uptime, 3600)
         minutes, seconds = divmod(remainder, 60)
         published_db, pending_db = self.db.count_by_status()
+        active_posts, due_posts = (
+            self.db.count_published_post_checks()
+            if hasattr(self.db, "count_published_post_checks")
+            else (0, 0)
+        )
         status = "⏸ НА ПАУЗЕ" if self.state.is_paused else "🟢 АКТИВЕН"
         mode = "\nРежим: DRY_RUN" if self.settings.dry_run else ""
         browser_state = (
@@ -36,9 +41,13 @@ class AdminMixin:
         quiet_hours_enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
         discount_filter = self.db.get_setting("ozon_discount_filter", "true") == "true"
         wb_stock_filter = self.db.get_setting("wb_min_stock_filter", "true") == "true"
+        wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
+        wb_fallback_enabled = self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
         ozon_min_disc = thresholds.ozon_min_discount(self)
         wb_min_stk = thresholds.wb_min_stock(self)
         max_price_inc = thresholds.max_price_increase_percent(self)
+        unavail_disc = thresholds.unavailable_mark_discount(self)
+        ozon_check_int = thresholds.ozon_check_interval_seconds(self)
         selected_target = self.db.get_setting("publication_target", "main")
         target_label = "тестовый" if selected_target == "test" else "основной"
         return (
@@ -53,7 +62,11 @@ class AdminMixin:
             f"Перерыв публикаций: {quiet_start}–{quiet_end} ({self.settings.timezone})\n"
             f"Фильтр скидки Ozon ≥{ozon_min_disc:g}%: {'включён' if discount_filter else 'выключен'}\n"
             f"Фильтр остатков WB ≥{wb_min_stk}: {'включён' if wb_stock_filter else 'выключен'}\n"
+            f"Резерв цены WB: {'включён' if wb_fallback_enabled else 'выключен'}\n"
             f"Порог подорожания: ≥{max_price_inc:g}%\n"
+            f"Порог пометки «Неактуально»: >{unavail_disc:g}%\n"
+            f"Интервал проверок Ozon: {ozon_check_int}с\n"
+            f"Мониторинг постов: активных {active_posts} (к проверке: {due_posts})\n"
             f"Аптайм: {hours}ч {minutes}м {seconds}с\n\n"
             f"🛡 Антибот и карточки:\n"
             f"• Браузер (Playwright): {browser_state}\n"
@@ -95,6 +108,12 @@ class AdminMixin:
             if self.db.get_setting("wb_min_stock_filter", "true") == "true"
             else f"⏸ Остаток WB ≥{wb_min_stk}: ВЫКЛ"
         )
+        wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
+        wb_fallback_label = (
+            "✅ Резерв цены WB: ВКЛ"
+            if self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
+            else "⏸ Резерв цены WB: ВЫКЛ"
+        )
         selected_target = self.db.get_setting("publication_target", "main")
         target_buttons = [
             Button.inline(
@@ -116,11 +135,16 @@ class AdminMixin:
             [Button.inline("⏰ Настроить интервал перерыва", b"edit_schedule")],
             [Button.inline(discount_label, b"toggle_ozon_discount")],
             [Button.inline(wb_stock_filter_label, b"toggle_wb_stock_filter")],
+            [Button.inline(wb_fallback_label, b"toggle_wb_fallback_price")],
             [
                 Button.inline("🎯 Порог Ozon %", b"edit_ozon_discount_threshold"),
                 Button.inline("📦 Мин. остаток WB", b"edit_wb_stock_threshold"),
             ],
-            [Button.inline("📈 Порог роста цены %", b"edit_price_increase_threshold")],
+            [
+                Button.inline("📈 Порог роста цены %", b"edit_price_increase_threshold"),
+                Button.inline("🏷 Порог «Неактуально» %", b"edit_unavailable_discount_threshold"),
+            ],
+            [Button.inline("⏱ Интервал проверок Ozon (с)", b"edit_ozon_check_interval")],
             [
                 Button.inline("📈 Источники", b"source_stats"),
                 Button.inline("🧪 Каскад", b"cascade_stats"),
@@ -246,6 +270,8 @@ class AdminMixin:
         self.awaiting_ozon_discount_input = False
         self.awaiting_wb_stock_input = False
         self.awaiting_price_increase_input = False
+        self.awaiting_unavailable_discount_input = False
+        self.awaiting_ozon_interval_input = False
 
     def _register_admin_handlers(self) -> None:
         @self.bot_client.on(events.NewMessage(chats=self.settings.admin_id, pattern=r"^/start$"))
@@ -301,6 +327,30 @@ class AdminMixin:
                     await event.respond("Введите число от 1 до 500 (например, 15).")
                     return
                 self.db.set_setting("max_price_increase_percent", f"{num:g}")
+                self._reset_admin_input_modes()
+                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                return
+            if getattr(self, "awaiting_unavailable_discount_input", False):
+                try:
+                    num = float(value.replace(",", "."))
+                    if not (0 <= num <= 99):
+                        raise ValueError
+                except ValueError:
+                    await event.respond("Введите число от 0 до 99 (например, 50).")
+                    return
+                self.db.set_setting("unavailable_mark_discount_percent", f"{num:g}")
+                self._reset_admin_input_modes()
+                await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                return
+            if getattr(self, "awaiting_ozon_interval_input", False):
+                try:
+                    num_int = int(value)
+                    if not (5 <= num_int <= 3600):
+                        raise ValueError
+                except ValueError:
+                    await event.respond("Введите целое число от 5 до 3600 секунд (например, 30).")
+                    return
+                self.db.set_setting("ozon_check_interval_seconds", str(num_int))
                 self._reset_admin_input_modes()
                 await event.respond(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 return
@@ -413,6 +463,24 @@ class AdminMixin:
                     buttons=[[Button.inline("↩️ В панель", b"refresh")]],
                 )
                 await event.answer()
+            elif data == b"edit_unavailable_discount_threshold":
+                self._reset_admin_input_modes()
+                self.awaiting_unavailable_discount_input = True
+                await event.edit(
+                    "Отправьте порог скидки (%) для пометки поста «❌ Неактуально» вместо удаления "
+                    "(от 0 до 99), например: 50",
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
+            elif data == b"edit_ozon_check_interval":
+                self._reset_admin_input_modes()
+                self.awaiting_ozon_interval_input = True
+                await event.edit(
+                    "Отправьте минимальный интервал между проверками карточек Ozon в секундах "
+                    "(от 5 до 3600), например: 30",
+                    buttons=[[Button.inline("↩️ В панель", b"refresh")]],
+                )
+                await event.answer()
             elif data == b"toggle_quiet_hours":
                 enabled = self.db.get_setting("quiet_hours_enabled", "true") == "true"
                 self.db.set_setting("quiet_hours_enabled", "false" if enabled else "true")
@@ -432,6 +500,12 @@ class AdminMixin:
                 self.db.set_setting("wb_min_stock_filter", "false" if enabled else "true")
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Фильтр минимального остатка WB обновлён")
+            elif data == b"toggle_wb_fallback_price":
+                wb_fallback_default = "true" if getattr(self.settings, "wb_allow_fallback_price", True) else "false"
+                enabled = self.db.get_setting("wb_allow_fallback_price", wb_fallback_default) == "true"
+                self.db.set_setting("wb_allow_fallback_price", "false" if enabled else "true")
+                await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
+                await event.answer("Настройка резервной цены WB обновлена")
             elif data == b"select_main_channel":
                 self.db.set_setting("publication_target", "main")
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())

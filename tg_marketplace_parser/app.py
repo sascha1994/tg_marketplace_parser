@@ -48,8 +48,7 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self._rub_to_byn_rate: float = settings.rub_to_byn_fallback_rate
         self._rate_updated_at: float = 0.0
         self._rate_lock = asyncio.Lock()
-        self.awaiting_schedule_input = False
-        self.awaiting_ozon_discount_input = False
-        self.awaiting_wb_stock_input = False
+        self._wb_blocked_hosts_until: dict[str, float] = {}
         self._last_ozon_stock_check_at = 0.0
+        self._reset_admin_input_modes()
         self._register_admin_handlers()

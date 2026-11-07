@@ -80,5 +80,5 @@ class MarketDataMixin(HttpClientMixin, ImageDownloadMixin, WildberriesMixin, Ozo
             total_quantity=card.total_quantity,
             rating=card.rating,
             reviews_count=card.reviews_count,
+            price_source=card.price_source or product.price_source,
         )
-

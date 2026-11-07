@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 from contextlib import suppress
 import logging
+import signal
 import time
 from telethon.utils import get_peer_id
 from .common import (
@@ -13,6 +14,24 @@ from .optional_dependencies import CurlAsyncSession
 
 
 class RuntimeMixin:
+    async def shutdown(self, sig_name: str = "SIGTERM") -> None:
+        """Корректно отключает Telegram-клиентов по сигналу остановки контейнера/процесса."""
+        log(f"Получен сигнал {sig_name}, выполняется корректное завершение работы...")
+        with suppress(Exception):
+            await self.user_client.disconnect()
+        with suppress(Exception):
+            await self.bot_client.disconnect()
+
+    def _register_signal_handlers(self) -> None:
+        with suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                with suppress(NotImplementedError, ValueError, RuntimeError):
+                    loop.add_signal_handler(
+                        sig,
+                        lambda s=sig.name: asyncio.create_task(self.shutdown(s)),
+                    )
+
     def write_heartbeat(self) -> None:
         """Обновляет файл heartbeat для проверки работоспособности контейнера."""
         with suppress(OSError):
@@ -76,6 +95,7 @@ class RuntimeMixin:
             )
 
         try:
+            self._register_signal_handlers()
             log("Авторизация Telegram-клиентов")
             await self.user_client.start()
             await self.bot_client.start(bot_token=self.settings.bot_token)

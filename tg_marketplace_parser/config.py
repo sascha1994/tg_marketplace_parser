@@ -80,6 +80,8 @@ class Settings:
     wb_min_stock: int = 3
     unavailable_mark_discount_percent: float = 50.0
     max_price_increase_percent: float = 15.0
+    ozon_check_interval_seconds: int = 60
+    wb_allow_fallback_price: bool = True
     scheduled_max_attempts: int = 20
     recheck_delay_seconds: int = 15 * 60
     catchup_max_messages: int = 50
@@ -187,6 +189,8 @@ class Settings:
             max_price_increase_percent=env_float(
                 "MAX_PRICE_INCREASE_PERCENT", default=15.0, minimum=0
             ),
+            ozon_check_interval_seconds=env_int("OZON_CHECK_INTERVAL_SECONDS", default=60, minimum=5),
+            wb_allow_fallback_price=env_bool("WB_ALLOW_FALLBACK_PRICE", default=True),
             scheduled_max_attempts=env_int("SCHEDULED_MAX_ATTEMPTS", default=20, minimum=1),
             recheck_delay_seconds=env_int("RECHECK_DELAY_SECONDS", default=15 * 60, minimum=30),
             catchup_max_messages=env_int("CATCHUP_MAX_MESSAGES", default=50, minimum=0),

@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import suppress
 from dataclasses import replace
+import time
 from telethon.tl.functions.messages import GetWebPageRequest
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -10,8 +11,48 @@ from .marketplace_parsing import extract_price_from_post_text, get_wb_candidate_
 from .message_parsing import match_message_webpage_obj
 from .models import ProductCardData, record_cascade
 
+WB_HOST_BLOCK_TTL_SECONDS = 180.0
+
 
 class WildberriesMixin:
+    def _get_wb_blocked_hosts(self) -> dict[str, float]:
+        blocked = getattr(self, "_wb_blocked_hosts_until", None)
+        if not isinstance(blocked, dict):
+            blocked = {}
+            self._wb_blocked_hosts_until = blocked
+        return blocked
+
+    def _is_wb_host_blocked(self, host: str) -> bool:
+        blocked = self._get_wb_blocked_hosts()
+        until = blocked.get(host)
+        if until is None:
+            return False
+        if time.time() >= until:
+            blocked.pop(host, None)
+            return False
+        return True
+
+    def _mark_wb_host_blocked(self, host: str, ttl_seconds: float = WB_HOST_BLOCK_TTL_SECONDS) -> None:
+        if host:
+            self._get_wb_blocked_hosts()[host] = time.time() + ttl_seconds
+
+    def _clear_wb_host_blocked(self, host: str | None = None) -> None:
+        blocked = self._get_wb_blocked_hosts()
+        if host is None:
+            blocked.clear()
+        else:
+            blocked.pop(host, None)
+
+    def _is_wb_fallback_price_allowed(self) -> bool:
+        db = getattr(self, "db", None)
+        if db is not None and hasattr(db, "get_setting"):
+            with suppress(Exception):
+                raw = db.get_setting("wb_allow_fallback_price", "")
+                if raw in {"true", "false"}:
+                    return raw == "true"
+        settings = getattr(self, "settings", None)
+        return bool(getattr(settings, "wb_allow_fallback_price", True))
+
     async def _resolve_wb_basket_host(
         self,
         sku_int: int,
@@ -63,6 +104,7 @@ class WildberriesMixin:
                     return found_host, found_card
 
         return primary_host, None
+
     async def _fetch_wb_basket_card_extras(
         self,
         sku: str,
@@ -154,6 +196,7 @@ class WildberriesMixin:
             reviews_count,
             card_exists,
         )
+
     async def fetch_wb_card_data(
         self,
         sku: str,
@@ -226,7 +269,7 @@ class WildberriesMixin:
 
         for base_endpoint, origin_url in api_hosts:
             host_key = urlparse(base_endpoint).netloc
-            if host_key in blocked_hosts:
+            if host_key in blocked_hosts or self._is_wb_host_blocked(host_key):
                 continue
 
             headers = dict(wb_headers)
@@ -245,8 +288,10 @@ class WildberriesMixin:
                 if http_status in {403, 429, 404}:
                     if http_status in {403, 429}:
                         blocked_hosts.add(host_key)
+                        self._mark_wb_host_blocked(host_key)
                     break
 
+                self._clear_wb_host_blocked(host_key)
                 parsed = parse_wb_detail_payload(
                     payload,
                     sku=sku,
@@ -267,7 +312,7 @@ class WildberriesMixin:
                 return card_data
 
             # Пробуем также RUB-витрину (Москва -1257786 и 123585595), если для BYN цены не оказалось
-            if host_key not in blocked_hosts:
+            if host_key not in blocked_hosts and not self._is_wb_host_blocked(host_key):
                 for rub_dest in (-1257786, 123585595):
                     rub_url = (
                         f"{base_endpoint}"
@@ -279,7 +324,9 @@ class WildberriesMixin:
                     if payload_rub.get("_http_status") in {403, 429, 404}:
                         if payload_rub.get("_http_status") in {403, 429}:
                             blocked_hosts.add(host_key)
+                            self._mark_wb_host_blocked(host_key)
                         break
+                    self._clear_wb_host_blocked(host_key)
                     parsed_rub = parse_wb_detail_payload(
                         payload_rub,
                         sku=sku,
@@ -302,7 +349,7 @@ class WildberriesMixin:
             return replace(card_data, in_stock=False, price_byn=None) if card_data else ProductCardData(in_stock=False)
 
         # 3. Пробуем поисковый API WB (search.wb.ru/exactmatch/ru/{shard}/v18/search и v9/search) по артикулу
-        if card_data is None or card_data.price_byn is None:
+        if (card_data is None or card_data.price_byn is None) and not self._is_wb_host_blocked("search.wb.ru"):
             search_shards = ("common", "preset", "msk")
             search_blocked = False
             for api_v in ("v18", "v9"):
@@ -321,9 +368,11 @@ class WildberriesMixin:
                         s_status = s_payload.get("_http_status")
                         if s_status == 403:
                             search_blocked = True
+                            self._mark_wb_host_blocked("search.wb.ru")
                             break
                         if s_status in {429, 404}:
                             continue
+                        self._clear_wb_host_blocked("search.wb.ru")
                         parsed_search = parse_wb_detail_payload(
                             s_payload,
                             sku=sku,
@@ -344,6 +393,7 @@ class WildberriesMixin:
             )
             if fresh_cookies:
                 self._sync_cookies_to_http_clients(fresh_cookies)
+                self._clear_wb_host_blocked()
             record_cascade(self, "wb_browser", browser_card is not None and browser_card.price_byn is not None)
             if browser_card is not None:
                 if browser_card.in_stock is False and (card_data is None or card_data.price_byn is None):
@@ -387,11 +437,12 @@ class WildberriesMixin:
 
         # 6. Если живой эндпоинт цен закрыт антиботом (403) при первичной обработке поста (есть source_text/messages),
         # и карточка существует и не помечена как «нет в наличии»:
-        # используем последнюю известную цену из price-history.json или цену из текста поста.
+        # используем последнюю известную цену из price-history.json или цену из текста поста (если разрешено).
         # При фоновом мониторинге опубликованных постов (без source_text/messages) резервная цена не подставляется,
         # чтобы не маскировать отсутствие товара или подорожание старой исторической ценой.
         if (
             (source_text or messages)
+            and self._is_wb_fallback_price_allowed()
             and explicit_oos_responses == 0
             and card_data is not None
             and card_data.in_stock is not False
@@ -405,11 +456,17 @@ class WildberriesMixin:
                     f"Для товара Wildberries (арт. {sku}) использована резервная цена {fallback_price} BYN "
                     f"(история цен / текст поста)"
                 )
-                card_data = replace(card_data, price_byn=fallback_price, in_stock=True)
+                card_data = replace(
+                    card_data,
+                    price_byn=fallback_price,
+                    in_stock=True,
+                    price_source="fallback",
+                )
             elif card_exists and card_data.title:
                 card_data = replace(card_data, in_stock=True)
 
         return card_data
+
     async def fetch_wb_cards_batch(
         self,
         skus: Iterable[str],
@@ -418,6 +475,12 @@ class WildberriesMixin:
         requested = list(dict.fromkeys(str(sku).strip() for sku in skus if str(sku).strip()))[:20]
         if not requested:
             return {}
+        if self._is_wb_host_blocked("card.wb.ru"):
+            return {sku: None for sku in requested}
+        if hasattr(self, "get_rub_to_byn_rate"):
+            rub_rate = await self.get_rub_to_byn_rate()
+        else:
+            rub_rate = getattr(self, "_rub_to_byn_rate", 0.0345)
         encoded_skus = ",".join(requested)
         url = (
             "https://card.wb.ru/cards/v4/detail"
@@ -433,13 +496,16 @@ class WildberriesMixin:
             timeout_override=8.0,
         )
         if not payload or payload.get("_http_status") in {403, 404, 429}:
+            if payload and payload.get("_http_status") in {403, 429}:
+                self._mark_wb_host_blocked("card.wb.ru")
             return {sku: None for sku in requested}
+        self._clear_wb_host_blocked("card.wb.ru")
         return {
             sku: parse_wb_detail_payload(
                 payload,
                 sku=sku,
                 currency="BYN",
-                rub_to_byn_rate=self._rub_to_byn_rate,
+                rub_to_byn_rate=rub_rate,
             )
             for sku in requested
         }

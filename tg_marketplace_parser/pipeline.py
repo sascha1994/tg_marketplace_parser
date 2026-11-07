@@ -339,24 +339,24 @@ class PipelineMixin:
                 log(f"Публикация {product.platform} {product.sku} отложена до окончания перерыва")
                 return False
 
-            text = build_publication_text(
-                source_text,
-                [product],
-                include_source_notes=self.settings.include_source_notes,
-            )
-            message_ids = await self.publish(text, messages, [product], target_channel)
-            if not message_ids:
-                raise RuntimeError("Telegram не вернул ID опубликованного сообщения")
-            published_at = int(time.time())
-            self.db.save_published_post(
-                product,
-                text,
-                message_ids,
-                product.discount_percent,
-                published_at,
-                target_channel=target_channel,
-            )
-            return True
+        text = build_publication_text(
+            source_text,
+            [product],
+            include_source_notes=self.settings.include_source_notes,
+        )
+        message_ids = await self.publish(text, messages, [product], target_channel)
+        if not message_ids:
+            raise RuntimeError("Telegram не вернул ID опубликованного сообщения")
+        published_at = int(time.time())
+        self.db.save_published_post(
+            product,
+            text,
+            message_ids,
+            product.discount_percent,
+            published_at,
+            target_channel=target_channel,
+        )
+        return True
 
     async def handle_published_post_check(self, row: dict, product: ProductInfo, card, now: int) -> None:
         try:
@@ -429,6 +429,22 @@ class PipelineMixin:
                         "пост оставлен без изменений",
                         logging.WARNING,
                     )
+        except FloodWaitError as exc:
+            wait_seconds = int(getattr(exc, "seconds", 0))
+            delay = max(wait_seconds + 5, thresholds.recheck_delay_seconds(self))
+            self.db.defer_published_post_check(row["post_id"], now + delay)
+            self._last_ozon_stock_check_at = max(
+                getattr(self, "_last_ozon_stock_check_at", 0.0),
+                time.time() + wait_seconds,
+            )
+            self.record_admin_error(
+                f"Проверка наличия {product.platform} {product.sku}: FloodWait {wait_seconds} сек."
+            )
+            log(
+                f"FloodWait {wait_seconds} сек. при проверке поста {product.platform} {product.sku}; "
+                f"повтор отложен на {delay} сек.",
+                logging.WARNING,
+            )
         except Exception as exc:
             self.db.defer_published_post_check(row["post_id"], now + thresholds.recheck_delay_seconds(self))
             self.record_admin_error(
@@ -581,47 +597,39 @@ class PipelineMixin:
             results.append((row, product, card))
         return results
 
-    async def scheduled_publication_worker(self) -> None:
-        while True:
-            now = int(time.time())
-            if not self.quiet_period_remaining():
-                scheduled = self.db.get_due_scheduled_publications(now, limit=20)
-                if scheduled:
-                    wb_rows = [
-                        row for row in scheduled
-                        if json.loads(row["product_json"]).get("platform") == "Wildberries"
-                    ]
-                    if len(wb_rows) > 1:
-                        checked = await self.check_wb_batch(
-                            wb_rows,
-                            batch_error_label="Пакетная проверка отложенных WB",
-                            item_error_label="Индивидуальная проверка отложенной публикации WB",
-                            include_source_text=True,
-                        )
-                        for row, _product, card in checked:
-                            await self.handle_scheduled_publication(row, card)
-                        await asyncio.sleep(1)
-                        continue
+    async def run_scheduled_publication_step(self, now: int | None = None) -> float:
+        current_now = int(time.time()) if now is None else now
+        ozon_interval = thresholds.ozon_check_interval_seconds(self)
+        if not self.quiet_period_remaining():
+            scheduled = self.db.get_due_scheduled_publications(current_now, limit=20)
+            if scheduled:
+                wb_rows = [
+                    row for row in scheduled
+                    if json.loads(row["product_json"]).get("platform") == "Wildberries"
+                ]
+                if len(wb_rows) > 1:
+                    checked = await self.check_wb_batch(
+                        wb_rows,
+                        batch_error_label="Пакетная проверка отложенных WB",
+                        item_error_label="Индивидуальная проверка отложенной публикации WB",
+                        include_source_text=True,
+                    )
+                    for row, _product, card in checked:
+                        await self.handle_scheduled_publication(row, card)
+                    return 1.0
 
-                    row = scheduled[0]
+                row = scheduled[0]
+                product = ProductInfo(**json.loads(row["product_json"]))
+                if (
+                    product.platform == "Ozon"
+                    and time.time() - self._last_ozon_stock_check_at < ozon_interval
+                    and wb_rows
+                ):
+                    row = wb_rows[0]
                     product = ProductInfo(**json.loads(row["product_json"]))
-                    if product.platform == "Ozon" and time.time() - self._last_ozon_stock_check_at < 60 and wb_rows:
-                        row = wb_rows[0]
-                        product = ProductInfo(**json.loads(row["product_json"]))
-                    if product.platform == "Ozon":
-                        if time.time() - self._last_ozon_stock_check_at >= 60:
-                            self._last_ozon_stock_check_at = time.time()
-                            try:
-                                card = await self.fetch_card_for_product(
-                                    product,
-                                    source_text=row["source_text"],
-                                )
-                            except Exception:
-                                card = None
-                            await self.handle_scheduled_publication(row, card)
-                            await asyncio.sleep(1)
-                            continue
-                    else:
+                if product.platform == "Ozon":
+                    if time.time() - self._last_ozon_stock_check_at >= ozon_interval:
+                        self._last_ozon_stock_check_at = time.time()
                         try:
                             card = await self.fetch_card_for_product(
                                 product,
@@ -630,51 +638,66 @@ class PipelineMixin:
                         except Exception:
                             card = None
                         await self.handle_scheduled_publication(row, card)
-                        await asyncio.sleep(1)
-                        continue
+                        return 1.0
+                else:
+                    try:
+                        card = await self.fetch_card_for_product(
+                            product,
+                            source_text=row["source_text"],
+                        )
+                    except Exception:
+                        card = None
+                    await self.handle_scheduled_publication(row, card)
+                    return 1.0
 
-            expired_posts = self.db.expire_old_published_posts(now)
-            if expired_posts:
-                log(f"Мониторинг завершён для {expired_posts} постов старше суток")
-            due_posts = self.db.get_due_published_posts(now, limit=20)
-            due_wb_posts = [
-                row for row in due_posts
-                if json.loads(row["product_json"]).get("platform") == "Wildberries"
-            ]
-            if len(due_wb_posts) > 1:
-                checked_posts = await self.check_wb_batch(
-                    due_wb_posts,
-                    batch_error_label="Пакетная проверка WB",
-                    item_error_label="Индивидуальная проверка наличия WB",
-                )
-                for row, product, card in checked_posts:
-                    await self.handle_published_post_check(row, product, card, now)
-                await asyncio.sleep(1)
-                continue
-            if due_posts:
-                row = due_posts[0]
+        expired_posts = self.db.expire_old_published_posts(current_now)
+        if expired_posts:
+            log(f"Мониторинг завершён для {expired_posts} постов старше суток")
+        due_posts = self.db.get_due_published_posts(current_now, limit=20)
+        due_wb_posts = [
+            row for row in due_posts
+            if json.loads(row["product_json"]).get("platform") == "Wildberries"
+        ]
+        if len(due_wb_posts) > 1:
+            checked_posts = await self.check_wb_batch(
+                due_wb_posts,
+                batch_error_label="Пакетная проверка WB",
+                item_error_label="Индивидуальная проверка наличия WB",
+            )
+            for row, product, card in checked_posts:
+                await self.handle_published_post_check(row, product, card, current_now)
+            return 1.0
+        if due_posts:
+            row = due_posts[0]
+            product = ProductInfo(**json.loads(row["product_json"]))
+            if (
+                product.platform == "Ozon"
+                and time.time() - self._last_ozon_stock_check_at < ozon_interval
+                and due_wb_posts
+            ):
+                row = due_wb_posts[0]
                 product = ProductInfo(**json.loads(row["product_json"]))
-                if product.platform == "Ozon" and time.time() - self._last_ozon_stock_check_at < 60 and due_wb_posts:
-                    row = due_wb_posts[0]
-                    product = ProductInfo(**json.loads(row["product_json"]))
-                is_ozon = product.platform == "Ozon"
-                if is_ozon and time.time() - self._last_ozon_stock_check_at < 60:
-                    await asyncio.sleep(5)
-                    continue
-                if is_ozon:
-                    self._last_ozon_stock_check_at = time.time()
-                try:
-                    card = await self.fetch_card_for_product(product)
-                except Exception as exc:
-                    card = None
-                    self.record_admin_error(
-                        f"Проверка наличия {product.platform} {product.sku}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                await self.handle_published_post_check(row, product, card, now)
-                await asyncio.sleep(1)
-                continue
-            await asyncio.sleep(10)
+            is_ozon = product.platform == "Ozon"
+            if is_ozon and time.time() - self._last_ozon_stock_check_at < ozon_interval:
+                return 5.0
+            if is_ozon:
+                self._last_ozon_stock_check_at = time.time()
+            try:
+                card = await self.fetch_card_for_product(product)
+            except Exception as exc:
+                card = None
+                self.record_admin_error(
+                    f"Проверка наличия {product.platform} {product.sku}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            await self.handle_published_post_check(row, product, card, current_now)
+            return 1.0
+        return 10.0
+
+    async def scheduled_publication_worker(self) -> None:
+        while True:
+            sleep_seconds = await self.run_scheduled_publication_step()
+            await asyncio.sleep(sleep_seconds)
 
     async def process_job(self, job: Job) -> None:
         job.target_channel = job.target_channel or self.active_target_channel()

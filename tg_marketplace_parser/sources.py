@@ -42,7 +42,7 @@ class SourcesMixin:
         seen: set[int] = set()
         source_ids: list[int] = []
 
-        for peer in include_peers:
+        for peer in [*include_peers, *pinned_peers]:
             peer_id = get_peer_id(peer)
             if peer_id in seen:
                 continue

@@ -998,6 +998,12 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
         for quantity in (primary.total_quantity, secondary.total_quantity)
         if quantity is not None
     ]
+    if primary.price_byn is not None:
+        price_source = primary.price_source
+    elif secondary.price_byn is not None:
+        price_source = secondary.price_source
+    else:
+        price_source = primary.price_source or secondary.price_source or "live"
     return ProductCardData(
         title=title,
         brand=brand,
@@ -1010,4 +1016,5 @@ def merge_card_data(primary: ProductCardData | None, secondary: ProductCardData 
         rating=primary.rating if primary.rating is not None else secondary.rating,
         reviews_count=primary.reviews_count if primary.reviews_count is not None else secondary.reviews_count,
         raw_currency=primary.raw_currency or secondary.raw_currency,
+        price_source=price_source,
     )

@@ -18,17 +18,26 @@ class HttpClientMixin:
     async def get_rub_to_byn_rate(self) -> float:
         """Возвращает актуальный курс RUB -> BYN по данным Нацбанка РБ (с кэшированием на 6 часов)."""
         now = time.time()
-        if self._rate_updated_at > 0 and (now - self._rate_updated_at) < 21600:
-            return self._rub_to_byn_rate
+        rate_updated_at = getattr(self, "_rate_updated_at", 0.0)
+        fallback_rate = getattr(self, "_rub_to_byn_rate", 0.0345)
+        if rate_updated_at > 0 and (now - rate_updated_at) < 21600:
+            return fallback_rate
 
-        async with self._rate_lock:
-            if self._rate_updated_at > 0 and (time.time() - self._rate_updated_at) < 21600:
-                return self._rub_to_byn_rate
+        rate_lock = getattr(self, "_rate_lock", None)
+        if rate_lock is None:
+            rate_lock = asyncio.Lock()
+            self._rate_lock = rate_lock
+
+        async with rate_lock:
+            rate_updated_at = getattr(self, "_rate_updated_at", 0.0)
+            if rate_updated_at > 0 and (time.time() - rate_updated_at) < 21600:
+                return getattr(self, "_rub_to_byn_rate", fallback_rate)
 
             nbrb_url = "https://api.nbrb.by/exrates/rates/RUB?parammode=2"
-            if self.http_session is not None:
+            http_session = getattr(self, "http_session", None)
+            if http_session is not None:
                 with suppress(Exception):
-                    async with self.http_session.get(nbrb_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    async with http_session.get(nbrb_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                         if resp.status == 200:
                             data = await resp.json(content_type=None)
                             rate = float(data.get("Cur_OfficialRate") or 0)
@@ -40,7 +49,7 @@ class HttpClientMixin:
                                 return self._rub_to_byn_rate
 
             self._rate_updated_at = time.time()
-            return self._rub_to_byn_rate
+            return getattr(self, "_rub_to_byn_rate", fallback_rate)
     def _sync_cookies_to_http_clients(self, cookies: list[dict]) -> None:
         """Переносит антибот-cookies (Ozon abt_data и Wildberries x_wbaas_token/_wbauid) из браузера в curl_cffi и aiohttp."""
         if not cookies:

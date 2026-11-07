@@ -101,6 +101,8 @@ class DuplicateDB:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_pending_jobs_chat
+                ON pending_jobs(source_chat_id);
             CREATE TABLE IF NOT EXISTS blocklist (
                 kind TEXT NOT NULL CHECK(kind IN ('brand', 'keyword')),
                 value TEXT NOT NULL,
@@ -419,7 +421,7 @@ class DuplicateDB:
             "SELECT post_id, sku_key, product_json, publication_text, message_ids, published_at, "
             "next_check_at, check_interval_seconds, discount_percent, target_channel FROM published_posts "
             "WHERE status = 'active' AND next_check_at <= ? "
-            "ORDER BY next_check_at LIMIT ?",
+            "ORDER BY next_check_at ASC, COALESCE(discount_percent, 0) DESC, published_at DESC LIMIT ?",
             (now, limit),
         ).fetchall()
         return [
@@ -437,6 +439,17 @@ class DuplicateDB:
             }
             for row in rows
         ]
+
+    def count_published_post_checks(self, now: int | None = None) -> tuple[int, int]:
+        check_now = int(time.time()) if now is None else now
+        active_row = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN next_check_at <= ? THEN 1 ELSE 0 END), 0) "
+            "FROM published_posts WHERE status = 'active'",
+            (check_now,),
+        ).fetchone()
+        if not active_row:
+            return 0, 0
+        return int(active_row[0] or 0), int(active_row[1] or 0)
 
     def set_published_post_status(self, post_id: str, status: str) -> None:
         self._conn.execute(
@@ -560,10 +573,14 @@ class DuplicateDB:
         return jobs
 
     def pending_message_ids(self, source_chat_id: int) -> set[int]:
+        rows = self._conn.execute(
+            "SELECT message_ids FROM pending_jobs WHERE source_chat_id = ?",
+            (source_chat_id,),
+        ).fetchall()
         result: set[int] = set()
-        for job in self.load_pending_jobs(limit=10_000):
-            if job["source_chat_id"] == source_chat_id:
-                result.update(job["message_ids"])
+        for (raw_ids,) in rows:
+            with suppress(TypeError, ValueError):
+                result.update(int(item) for item in json.loads(raw_ids))
         return result
 
     def get_cursor(self, chat_id: int) -> int | None:
