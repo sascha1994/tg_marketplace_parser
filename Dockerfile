@@ -2,8 +2,6 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-ARG PLAYWRIGHT_VERSION=1.50.0
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -25,7 +23,7 @@ RUN apt-get update && \
         tzdata \
         fonts-liberation \
         fonts-noto-core && \
-    pip install "playwright==${PLAYWRIGHT_VERSION}" && \
+    pip install "playwright>=1.47.0" && \
     playwright install-deps chromium && \
     playwright install chromium && \
     chmod -R a+rX /ms-playwright && \
@@ -34,7 +32,7 @@ RUN apt-get update && \
 
 # 3. Слой Python-зависимостей (пересобирается только при изменении requirements.txt)
 COPY requirements.txt .
-RUN pip install -r requirements.txt "playwright==${PLAYWRIGHT_VERSION}"
+RUN pip install -r requirements.txt
 
 # 4. Лёгкий слой с кодом приложения (~100 КБ — при обновлении кода скачивается только он)
 COPY --chown=app:app tg_marketplace_parser ./tg_marketplace_parser
