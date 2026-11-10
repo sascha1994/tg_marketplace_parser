@@ -1,5 +1,6 @@
-from dataclasses import dataclass, field
 from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass, field
 import time
 
 @dataclass(frozen=True)
@@ -114,6 +115,23 @@ class ParserState:
     active_jobs: int = 0
     recovered_jobs: int = 0
     caught_up_posts: int = 0
+    # Детализация отсева по фильтрам и причинам
+    filtered_out_of_stock: int = 0
+    filtered_wb_stock: int = 0
+    filtered_ozon_discount: int = 0
+    filtered_blocklist: int = 0
+    filtered_no_price: int = 0
+    rejected_no_links: int = 0
+    rejected_invalid_url: int = 0
+    # Жизненный цикл опубликованных и отложенных постов
+    posts_deleted: int = 0
+    deleted_oos: int = 0
+    deleted_price_up: int = 0
+    posts_marked_unavailable: int = 0
+    marked_oos: int = 0
+    marked_price_up: int = 0
+    scheduled_queued: int = 0
+    scheduled_cancelled: int = 0
     last_published_at: float | None = None
     recent_jobs: deque = field(default_factory=lambda: deque(maxlen=15))
     recent_errors: deque = field(default_factory=lambda: deque(maxlen=10))
@@ -124,10 +142,65 @@ class ParserState:
         counters = self.cascade_stats.setdefault(step, [0, 0])
         counters[0 if success else 1] += 1
 
+    def reset_counters(self) -> None:
+        """Обнуляет накопительные счётчики статистики в памяти."""
+        for attr in (
+            "incoming",
+            "published",
+            "duplicates",
+            "out_of_stock",
+            "rejected",
+            "errors",
+            "queue_dropped",
+            "browser_resolved",
+            "http_resolved",
+            "cards_parsed",
+            "filtered_out_of_stock",
+            "filtered_wb_stock",
+            "filtered_ozon_discount",
+            "filtered_blocklist",
+            "filtered_no_price",
+            "rejected_no_links",
+            "rejected_invalid_url",
+            "posts_deleted",
+            "deleted_oos",
+            "deleted_price_up",
+            "posts_marked_unavailable",
+            "marked_oos",
+            "marked_price_up",
+            "scheduled_queued",
+            "scheduled_cancelled",
+        ):
+            setattr(self, attr, 0)
+        self.last_published_at = None
+        self.cascade_stats.clear()
+        self.recent_jobs.clear()
+        self.recent_errors.clear()
+
+
+def record_stat(owner: object, metric: str, amount: int = 1, timestamp: float | None = None) -> None:
+    """Безопасно увеличивает счётчик статистики в памяти (ParserState) и в БД (DuplicateDB)."""
+    if amount <= 0:
+        return
+    state = getattr(owner, "state", None)
+    if state is not None and hasattr(state, metric):
+        with suppress(Exception):
+            setattr(state, metric, getattr(state, metric) + amount)
+    db = getattr(owner, "db", None)
+    bump = getattr(db, "bump_stat", None)
+    if callable(bump):
+        with suppress(Exception):
+            bump(metric, amount, timestamp=timestamp)
+
 
 def record_cascade(owner: object, step: str, success: bool) -> None:
-    """Безопасно фиксирует результат шага каскада на объекте владельца (если есть state)."""
+    """Безопасно фиксирует результат шага каскада на объекте владельца (в памяти и БД)."""
     state = getattr(owner, "state", None)
     recorder = getattr(state, "record_cascade", None)
     if callable(recorder):
         recorder(step, success)
+    db = getattr(owner, "db", None)
+    bump_cascade = getattr(db, "bump_cascade_stat", None)
+    if callable(bump_cascade):
+        with suppress(Exception):
+            bump_cascade(step, success)

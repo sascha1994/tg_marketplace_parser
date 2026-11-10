@@ -105,6 +105,8 @@ from .models import (
     ParserState,
     ProductCardData,
     ProductInfo,
+    record_cascade,
+    record_stat,
 )
 from .optional_dependencies import (
     CurlAsyncSession,

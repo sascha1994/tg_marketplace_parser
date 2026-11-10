@@ -4,12 +4,26 @@ from . import thresholds
 from .common import log
 from .http_client import HttpClientMixin
 from .images import ImageDownloadMixin
-from .models import ProductInfo
+from .models import ProductInfo, record_stat
 from .ozon import OzonMixin
 from .wildberries import WildberriesMixin
 
 
 class MarketDataMixin(HttpClientMixin, ImageDownloadMixin, WildberriesMixin, OzonMixin):
+    def _set_enrichment_reject_reason(self, sku_key: str, reason: str) -> None:
+        reasons = getattr(self, "_enrichment_reject_reasons", None)
+        if not isinstance(reasons, dict):
+            reasons = {}
+            self._enrichment_reject_reasons = reasons
+        if sku_key:
+            reasons[sku_key] = reason
+
+    def _pop_enrichment_reject_reason(self, sku_key: str, default: str = "out_of_stock") -> str:
+        reasons = getattr(self, "_enrichment_reject_reasons", None)
+        if isinstance(reasons, dict):
+            return reasons.pop(sku_key, default)
+        return default
+
     async def enrich_product_with_card(
         self,
         product: ProductInfo,
@@ -21,7 +35,10 @@ class MarketDataMixin(HttpClientMixin, ImageDownloadMixin, WildberriesMixin, Ozo
         Возвращает None, если товара нет в наличии или карточка недоступна.
         """
         if not product.sku:
-            return None if self.settings.require_sku else product
+            if self.settings.require_sku:
+                MarketDataMixin._set_enrichment_reject_reason(self, product.sku_key, "invalid_url")
+                return None
+            return product
 
         if product.platform == "Wildberries":
             card = await self.fetch_wb_card_data(
@@ -38,10 +55,11 @@ class MarketDataMixin(HttpClientMixin, ImageDownloadMixin, WildberriesMixin, Ozo
             )
 
         if card is not None:
-            self.state.cards_parsed += 1
+            record_stat(self, "cards_parsed")
 
         if card is not None and card.in_stock is False:
             if self.settings.skip_out_of_stock:
+                MarketDataMixin._set_enrichment_reject_reason(self, product.sku_key, "out_of_stock")
                 log(f"Товар {product.platform} (арт. {product.sku}) отсутствует в наличии — публикация отменена")
                 return None
 
@@ -52,6 +70,7 @@ class MarketDataMixin(HttpClientMixin, ImageDownloadMixin, WildberriesMixin, Ozo
             and card.total_quantity is not None
             and card.total_quantity < thresholds.wb_min_stock(self)
         ):
+            MarketDataMixin._set_enrichment_reject_reason(self, product.sku_key, "wb_stock")
             log(
                 f"Товар Wildberries (арт. {product.sku}) отклонён: "
                 f"остаток {card.total_quantity}, требуется не менее {thresholds.wb_min_stock(self)}"
@@ -59,6 +78,7 @@ class MarketDataMixin(HttpClientMixin, ImageDownloadMixin, WildberriesMixin, Ozo
             return None
 
         if self.settings.require_price and (card is None or card.price_byn is None or card.price_byn <= 0):
+            MarketDataMixin._set_enrichment_reject_reason(self, product.sku_key, "no_price")
             log(
                 f"Для товара {product.platform} (арт. {product.sku}) не найдена актуальная цена / нет в наличии — "
                 f"публикация отменена"

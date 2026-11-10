@@ -12,6 +12,7 @@ from urllib.parse import quote, urljoin, urlparse
 from .common import build_storefront_url, has_expanded_product_url, is_antibot_redirect_loop, is_non_product_url, is_ozon_host, log, normalize_host, strip_antibot_params, validate_marketplace_url
 from .constants import DEFAULT_HEADERS, HEAD_READ_LIMIT, HTTP_RETRY_ATTEMPTS, OZON_APP_HEADERS, OZON_DOMAINS, OZON_SHORT_PATH_RE, PREVIEW_USER_AGENTS, WB_BASKET_VOL_CACHE, WB_COOKIE_DOMAINS
 from .message_parsing import extract_product_url_from_text, extract_url_from_webpage_obj, resolve_ozon_canonical_host
+from .models import record_stat
 
 
 class HttpClientMixin:
@@ -392,12 +393,12 @@ class HttpClientMixin:
         if prefetched_body:
             upgraded = self._extract_sku_from_html(prefetched_body, clean_url)
             if upgraded:
-                self.state.http_resolved += 1
+                record_stat(self, "http_resolved")
                 return upgraded
 
         via_tg = await self._resolve_via_telegram_webpage(clean_url)
         if via_tg and has_expanded_product_url(via_tg):
-            self.state.http_resolved += 1
+            record_stat(self, "http_resolved")
             return via_tg
 
         if self.browser_resolver.is_available:
@@ -405,17 +406,17 @@ class HttpClientMixin:
             if fresh_cookies:
                 self._sync_cookies_to_http_clients(fresh_cookies)
             if via_browser and has_expanded_product_url(via_browser):
-                self.state.browser_resolved += 1
+                record_stat(self, "browser_resolved")
                 return via_browser
 
         via_curl = await self._resolve_via_curl_cffi(clean_url)
         if via_curl and has_expanded_product_url(via_curl):
-            self.state.http_resolved += 1
+            record_stat(self, "http_resolved")
             return via_curl
 
         via_api = await self._resolve_via_ozon_mobile_api(clean_url)
         if via_api and has_expanded_product_url(via_api):
-            self.state.http_resolved += 1
+            record_stat(self, "http_resolved")
             return via_api
 
         log(f"Артикул для короткой ссылки не найден: {clean_url}", logging.WARNING)
@@ -501,7 +502,7 @@ class HttpClientMixin:
             if self.curl_session is not None:
                 via_curl = await self._resolve_via_curl_cffi(clean_initial_url)
                 if via_curl and has_expanded_product_url(via_curl):
-                    self.state.http_resolved += 1
+                    record_stat(self, "http_resolved")
                     return via_curl
 
         assert self.http_session is not None
@@ -518,7 +519,7 @@ class HttpClientMixin:
 
             if has_expanded_product_url(current_url):
                 log(f"Артикул найден в URL на шаге {step}: {current_url}")
-                self.state.http_resolved += 1
+                record_stat(self, "http_resolved")
                 return current_url
 
             if is_non_product_url(current_url):
@@ -537,7 +538,7 @@ class HttpClientMixin:
                 next_url = urljoin(current_url, location)
                 if has_expanded_product_url(next_url):
                     log(f"Редирект {step}/{max_redirects}: {status} {current_url} -> {next_url}")
-                    self.state.http_resolved += 1
+                    record_stat(self, "http_resolved")
                     return next_url
 
                 if is_antibot_redirect_loop(current_url, next_url):
