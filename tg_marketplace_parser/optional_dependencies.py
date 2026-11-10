@@ -105,13 +105,21 @@ def _ensure_playwright_browser_installed() -> None:
     if os.getenv("AUTO_INSTALL_PLAYWRIGHT", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         return
     with suppress(Exception):
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
+        res = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--no-shell", "chromium"],
             capture_output=True,
             text=True,
             timeout=240,
             check=False,
         )
+        if res.returncode != 0:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                capture_output=True,
+                text=True,
+                timeout=240,
+                check=False,
+            )
 
 CurlAsyncSession = _load_curl_cffi()
 async_playwright_factory = _load_async_playwright()

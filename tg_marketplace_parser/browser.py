@@ -54,8 +54,8 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                 raw_ua, raw_platform = await page.evaluate("[navigator.userAgent, navigator.platform]")
                 clean_ua = raw_ua.replace("HeadlessChrome/", "Chrome/")
                 ver_match = re.search(r"Chrome/(\d+)\.(\d+\.\d+\.\d+)", clean_ua)
-                major = ver_match.group(1) if ver_match else "131"
-                full_ver = f"{major}.{ver_match.group(2)}" if ver_match else "131.0.0.0"
+                major = ver_match.group(1) if ver_match else "145"
+                full_ver = f"{major}.{ver_match.group(2)}" if ver_match else "145.0.0.0"
 
                 if "Linux" in raw_platform or "X11" in clean_ua:
                     platform_name = "Linux"
@@ -150,6 +150,8 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                 exec_path = _find_system_chromium()
                 if exec_path:
                     launch_kwargs["executable_path"] = exec_path
+                else:
+                    launch_kwargs["channel"] = "chromium"
                 if self.settings.ozon_proxy:
                     launch_kwargs["proxy"] = {"server": self.settings.ozon_proxy}
 
@@ -157,7 +159,11 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                     self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
                 except Exception:
                     launch_kwargs.pop("ignore_default_args", None)
-                    self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+                    try:
+                        self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+                    except Exception:
+                        launch_kwargs.pop("channel", None)
+                        self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
 
                 await self._context.add_init_script(MINIMAL_STEALTH_SCRIPT)
                 init_page = self._context.pages[0] if self._context.pages else await self._context.new_page()
