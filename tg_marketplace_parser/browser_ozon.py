@@ -6,10 +6,19 @@ import logging
 import time
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 from .common import build_storefront_url, has_expanded_product_url, is_ozon_host, log, normalize_image_url, ozon_product_path
+from .constants import ANTIBOT_MARKERS
 from .marketplace_parsing import merge_card_data, parse_html_product_card, parse_ozon_composer_payload, parse_ozon_visible_price_text
 from .message_parsing import extract_product_url_from_text, resolve_ozon_canonical_host
 from .models import ProductCardData
 from .pricing import extract_avg_month_price_from_text, extract_ozon_avg_price_from_state, extract_ozon_price_modal_urls
+
+
+def _is_antibot_title_or_html(text: str | None) -> bool:
+    """Проверяет, содержит ли заголовок или фрагмент страницы маркеры антибот-блокировки (включая Antibot Challenge Page)."""
+    low = (text or "").strip().casefold()
+    if not low:
+        return False
+    return any(marker in low for marker in ANTIBOT_MARKERS)
 
 
 class OzonBrowserMixin:
@@ -20,14 +29,93 @@ class OzonBrowserMixin:
             cookies = await self._context.cookies()
             return any(c.get("name") == "abt_data" and c.get("value") for c in cookies)
         return False
+
+    async def _wait_for_antibot_resolution(
+        self,
+        page,
+        target_url: str,
+        *,
+        initial_status: int = 0,
+        timeout_seconds: float = 10.0,
+    ) -> tuple[int, str, bool]:
+        """Ожидает прохождения JS-челленджа Ozon (Antibot Challenge Page / Доступ ограничен).
+
+        Если страница застряла на HTTP 403 из-за протухшей куки abt_data из профиля,
+        очищает cookies Ozon и перезагружает страницу, чтобы получить свежий токен.
+        Возвращает (status, title, is_blocked).
+        """
+        status = initial_status
+        title = ""
+        with suppress(Exception):
+            title = (await page.title()).strip()
+
+        start_ts = time.monotonic()
+        deadline = start_ts + max(3.0, timeout_seconds)
+        cleared_stale_cookies = False
+
+        while time.monotonic() < deadline:
+            has_abt = await self._has_abt_cookie()
+            if status not in {403, 429} and has_abt and title and not _is_antibot_title_or_html(title):
+                return status, title, False
+
+            elapsed = time.monotonic() - start_ts
+            if (
+                not cleared_stale_cookies
+                and elapsed >= min(3.5, timeout_seconds * 0.4)
+                and (status in {403, 429} or _is_antibot_title_or_html(title))
+            ):
+                cleared_stale_cookies = True
+                clear_fn = getattr(self, "_clear_ozon_cookies", None)
+                if callable(clear_fn):
+                    await clear_fn()
+                with suppress(Exception):
+                    resp = await page.goto(target_url, wait_until="domcontentloaded", timeout=10_000)
+                    if resp:
+                        status = resp.status
+                    title = (await page.title()).strip()
+                    if status not in {403, 429} and title and not _is_antibot_title_or_html(title):
+                        return status, title, False
+
+            await self._simulate_human_interaction(page)
+
+            with suppress(Exception):
+                reload_btn = await page.query_selector(
+                    "button#reload-button, button[type='submit'], a.reload-button, button"
+                )
+                if reload_btn:
+                    btn_text = ((await reload_btn.inner_text()) or "").strip().lower()
+                    if any(w in btn_text for w in ("обновить", "продолжить", "reload", "повторить", "continue")):
+                        await reload_btn.click()
+
+            await asyncio.sleep(0.8)
+            with suppress(Exception):
+                title = (await page.title()).strip()
+                body_snippet = await page.evaluate(
+                    "() => document.body ? (document.body.innerText || '').slice(0, 600) : ''"
+                )
+                if title and not _is_antibot_title_or_html(title) and not _is_antibot_title_or_html(body_snippet):
+                    status = 200
+                    return status, title, False
+
+        is_blocked = status in {403, 429} or not title or _is_antibot_title_or_html(title)
+        return status, title, is_blocked
+
     async def _warm_up_storefront(self, domain: str):
         """Открывает и прогревает главную страницу витрины (например https://ozon.by/ или https://www.ozon.ru/)."""
         assert self._context is not None
         existing = self._warm_pages.get(domain)
         if existing is not None:
             with suppress(Exception):
-                if not existing.is_closed() and is_ozon_host(urlparse(existing.url).hostname):
+                existing_title = (await existing.title()).strip()
+                if (
+                    not existing.is_closed()
+                    and is_ozon_host(urlparse(existing.url).hostname)
+                    and existing_title
+                    and not _is_antibot_title_or_html(existing_title)
+                ):
                     return existing
+            with suppress(Exception):
+                await existing.close()
             self._warm_pages.pop(domain, None)
 
         page = await self._context.new_page()
@@ -36,45 +124,34 @@ class OzonBrowserMixin:
 
         try:
             resp = await page.goto(home_url, wait_until="domcontentloaded", timeout=12_000)
-            status = resp.status if resp else 0
-            title = ""
-            with suppress(Exception):
-                title = (await page.title()).strip()
-
-            deadline = time.monotonic() + self.settings.browser_challenge_timeout
-            while time.monotonic() < deadline:
-                if await self._has_abt_cookie() and "доступ ограничен" not in title.lower():
-                    break
-
-                await self._simulate_human_interaction(page)
-
-                with suppress(Exception):
-                    reload_btn = await page.query_selector(
-                        "button#reload-button, button[type='submit'], a.reload-button, button"
-                    )
-                    if reload_btn:
-                        btn_text = ((await reload_btn.inner_text()) or "").strip().lower()
-                        if any(w in btn_text for w in ("обновить", "продолжить", "reload", "повторить")):
-                            await reload_btn.click()
-
-                await asyncio.sleep(0.8)
-                with suppress(Exception):
-                    title = (await page.title()).strip()
-                    if title and "доступ ограничен" not in title.lower() and "почти готово" not in title.lower():
-                        break
+            initial_status = resp.status if resp else 0
+            status, title, is_blocked = await self._wait_for_antibot_resolution(
+                page,
+                home_url,
+                initial_status=initial_status,
+                timeout_seconds=float(self.settings.browser_challenge_timeout),
+            )
 
             has_abt = await self._has_abt_cookie()
             log(
                 f"Прогрев витрины {domain}: HTTP {status}, title={title!r}, "
                 f"abt_data={'да' if has_abt else 'нет'}, url={page.url}"
             )
+            if is_blocked:
+                with suppress(Exception):
+                    await page.close()
+                self._warm_pages.pop(domain, None)
+                return None
+
             self._warm_pages[domain] = page
             return page
         except Exception as exc:
             log(f"Ошибка прогрева витрины {domain}: {type(exc).__name__}: {exc}", logging.DEBUG)
             with suppress(Exception):
                 await page.close()
+            self._warm_pages.pop(domain, None)
             return None
+
     async def _fetch_via_inpage_api(self, page, short_path: str, base_url: str) -> str | None:
         """Выполняет запросы к entrypoint-api / composer-api и самой короткой ссылке прямо из контекста прогретой страницы."""
         if not short_path or not short_path.startswith("/"):
@@ -129,6 +206,7 @@ class OzonBrowserMixin:
                 if debug_info:
                     log(f"In-page fetch ({page.url}): {debug_info}", logging.DEBUG)
         return None
+
     async def fetch_product_card(
         self,
         sku: str,
@@ -143,7 +221,7 @@ class OzonBrowserMixin:
            а при наличии ссылок на модальное окно «Стало дешевле» в widgetStates — сразу же подгружает JSON модалки
            в том же вызове без открытия новой вкладки.
         2. Если средняя цена не пришла в in-page API (требуется интерактивное открытие попапа):
-           открывает лёгкую вкладку с блокировкой тяжёлых медиа/картинок/шрифтов, перехватывает все XHR-ответы
+           открывает лёгкую вкладку с блокировкой тяжёлых медиа/шрифтов, перехватывает все XHR-ответы
            модальных окон Ozon, кликает по «Стало дешевле» (Playwright + JS fallback) и ждёт появления
            «Средняя за ...» / «Цена сейчас» в портале модального окна или в сетевом ответе.
         """
@@ -364,10 +442,10 @@ class OzonBrowserMixin:
                 intercepted_avg_byn: float | None = None
                 intercepted_card: ProductCardData | None = None
 
-                # Блокируем загрузку тяжёлых картинок, видео и шрифтов на вкладке-доноре, чтобы страница и Vue-гидратация загружались в 3 раза быстрее
+                # Блокируем загрузку тяжёлых видео и шрифтов на вкладке-доноре, сохраняя картинки для галереи и антибота
                 async def _fast_route_handler(route) -> None:
                     with suppress(Exception):
-                        if route.request.resource_type in {"image", "media", "font"}:
+                        if route.request.resource_type in {"media", "font"}:
                             await route.abort()
                             return
                         await route.continue_()
@@ -447,9 +525,22 @@ class OzonBrowserMixin:
                 )
                 try:
                     resp = await nav_page.goto(target_url, wait_until="domcontentloaded", timeout=11_000)
-                    if resp and resp.status == 404:
+                    nav_status = resp.status if resp else 0
+                    if nav_status == 404:
                         cookies = await self._export_cookies()
                         return ProductCardData(in_stock=False), cookies
+
+                    nav_title = ""
+                    with suppress(Exception):
+                        nav_title = (await nav_page.title()).strip()
+
+                    if nav_status in {403, 429} or _is_antibot_title_or_html(nav_title):
+                        await self._wait_for_antibot_resolution(
+                            nav_page,
+                            target_url,
+                            initial_status=nav_status,
+                            timeout_seconds=min(8.0, float(self.settings.browser_challenge_timeout)),
+                        )
 
                     # Ожидаем появления кнопки «Стало дешевле» (или уже отрисованной «Средняя за ...») до 3.2 сек
                     wait_deadline = time.monotonic() + 3.2
@@ -645,8 +736,8 @@ class OzonBrowserMixin:
                     cookies = await self._export_cookies()
                     return inpage_card, cookies
 
-            cookies = await self._export_cookies()
-            return None, cookies
+            return None, []
+
     async def resolve_short_url(self, clean_url: str) -> tuple[str | None, list[dict]]:
         """Раскрывает короткую ссылку Ozon через прогретый Chromium и возвращает (resolved_url, cookies)."""
         if not self._available:
@@ -796,5 +887,4 @@ class OzonBrowserMixin:
                     with suppress(Exception):
                         await nav_page.close()
 
-            cookies = await self._export_cookies()
-            return None, cookies
+            return None, []

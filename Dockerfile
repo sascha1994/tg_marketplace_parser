@@ -2,8 +2,6 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-ARG PLAYWRIGHT_VERSION=1.50.0
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -18,23 +16,29 @@ RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin app && \
     mkdir -p /app/data /ms-playwright && \
     chown -R app:app /app
 
-# 2. Тяжёлый базовый слой: системные библиотеки + Playwright Chromium (редко меняется, кэшируется на сервере)
+# 2. Тяжёлый базовый слой: системные библиотеки + WebGL/EGL + Playwright Chromium (редко меняется, кэшируется на сервере)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         tzdata \
+        libatomic1 \
+        libgl1 \
+        libegl1 \
+        libgbm1 \
+        libdrm2 \
+        libxkbcommon0 \
         fonts-liberation \
         fonts-noto-core && \
-    pip install "playwright==${PLAYWRIGHT_VERSION}" && \
+    pip install "playwright>=1.64.0" && \
     playwright install-deps chromium && \
-    playwright install chromium && \
+    playwright install --no-shell chromium && \
     chmod -R a+rX /ms-playwright && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/* /root/.cache
 
 # 3. Слой Python-зависимостей (пересобирается только при изменении requirements.txt)
 COPY requirements.txt .
-RUN pip install -r requirements.txt "playwright==${PLAYWRIGHT_VERSION}"
+RUN pip install -r requirements.txt
 
 # 4. Лёгкий слой с кодом приложения (~100 КБ — при обновлении кода скачивается только он)
 COPY --chown=app:app tg_marketplace_parser ./tg_marketplace_parser

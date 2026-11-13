@@ -171,6 +171,11 @@ ANTIBOT_MARKERS = (
     "почти готово",
     "проверяем браузер",
     "один момент",
+    "antibot challenge",
+    "antibot",
+    "challenge page",
+    "just a moment",
+    "attention required",
     "incidentid",
     "fab_chlg",
     "fab_chig",
@@ -306,10 +311,6 @@ META_TAG_RE = re.compile(
 
 H1_TAG_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
 TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-
-
-
-
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

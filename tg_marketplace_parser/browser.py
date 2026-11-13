@@ -28,15 +28,19 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
         self._available: bool = bool(settings.use_browser_resolver and async_playwright_factory is not None)
         self._cdp_ua_metadata: dict | None = None
         self.last_cookies: list[dict] = []
+
     @property
     def is_available(self) -> bool:
         return self._available
+
     @property
     def is_running(self) -> bool:
         return self._context is not None
+
     async def start_idle_monitor(self) -> None:
         if self._idle_task is None and self._available:
             self._idle_task = asyncio.create_task(self._idle_watchdog(), name="ozon-browser-watchdog")
+
     async def _idle_watchdog(self) -> None:
         while True:
             await asyncio.sleep(30)
@@ -47,6 +51,7 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                         if self._context is not None and (time.time() - self._last_used) >= self.settings.browser_idle_timeout:
                             log("Закрытие браузера Ozon после простоя для освобождения памяти")
                             await self._close_unlocked()
+
     async def _apply_cdp_stealth(self, page) -> None:
         """Применяет нативный C++ UserAgentOverride через CDP без расхождения ОС и без HeadlessChrome."""
         with suppress(Exception):
@@ -54,8 +59,8 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                 raw_ua, raw_platform = await page.evaluate("[navigator.userAgent, navigator.platform]")
                 clean_ua = raw_ua.replace("HeadlessChrome/", "Chrome/")
                 ver_match = re.search(r"Chrome/(\d+)\.(\d+\.\d+\.\d+)", clean_ua)
-                major = ver_match.group(1) if ver_match else "131"
-                full_ver = f"{major}.{ver_match.group(2)}" if ver_match else "131.0.0.0"
+                major = ver_match.group(1) if ver_match else "145"
+                full_ver = f"{major}.{ver_match.group(2)}" if ver_match else "145.0.0.0"
 
                 if "Linux" in raw_platform or "X11" in clean_ua:
                     platform_name = "Linux"
@@ -95,6 +100,20 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
 
             cdp = await page.context.new_cdp_session(page)
             await cdp.send("Emulation.setUserAgentOverride", self._cdp_ua_metadata)
+
+    async def _clear_ozon_cookies(self) -> None:
+        """Очищает антибот-cookies Ozon в контексте браузера и в дисковом кэше при блокировке 403."""
+        if self._context is None:
+            return
+        with suppress(Exception):
+            try:
+                await self._context.clear_cookies(domain=re.compile(r"ozon\.", re.IGNORECASE))
+            except TypeError:
+                await self._context.clear_cookies()
+        with suppress(OSError):
+            if os.path.isfile(self.settings.cookies_cache_path):
+                os.unlink(self.settings.cookies_cache_path)
+
     async def _ensure_context(self) -> bool:
         if not self._available:
             return False
@@ -127,9 +146,14 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                     "--disable-dev-shm-usage",
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
+                    "--disable-gpu-sandbox",
                     "--disable-infobars",
                     "--window-size=1920,1080",
                     "--lang=ru-RU,ru",
+                    "--enable-webgl",
+                    "--ignore-gpu-blocklist",
+                    "--use-gl=angle",
+                    "--use-angle=swiftshader",
                 ]
                 if self.settings.browser_headless:
                     chrome_args.append("--headless=new")
@@ -150,6 +174,8 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                 exec_path = _find_system_chromium()
                 if exec_path:
                     launch_kwargs["executable_path"] = exec_path
+                else:
+                    launch_kwargs["channel"] = "chromium"
                 if self.settings.ozon_proxy:
                     launch_kwargs["proxy"] = {"server": self.settings.ozon_proxy}
 
@@ -157,7 +183,11 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                     self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
                 except Exception:
                     launch_kwargs.pop("ignore_default_args", None)
-                    self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+                    try:
+                        self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+                    except Exception:
+                        launch_kwargs.pop("channel", None)
+                        self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
 
                 await self._context.add_init_script(MINIMAL_STEALTH_SCRIPT)
                 init_page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -170,6 +200,7 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
             log(f"Не удалось запустить браузер Playwright для Ozon: {type(exc).__name__}: {exc}", logging.WARNING)
             await self._close_unlocked()
             return False
+
     async def _simulate_human_interaction(self, page) -> None:
         with suppress(Exception):
             for _ in range(3):
@@ -177,6 +208,7 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                 y = random.randint(140, 720)
                 await page.mouse.move(x, y, steps=random.randint(4, 10))
                 await asyncio.sleep(random.uniform(0.1, 0.25))
+
     async def _export_cookies(self) -> list[dict]:
         if self._context is None:
             return []
@@ -189,6 +221,7 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                         json.dump(cookies, f, ensure_ascii=False)
                 return cookies
         return []
+
     async def _close_unlocked(self) -> None:
         for page in list(self._warm_pages.values()):
             with suppress(Exception):
@@ -202,6 +235,7 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
             with suppress(Exception):
                 await self._playwright.stop()
             self._playwright = None
+
     async def close(self) -> None:
         if self._idle_task is not None:
             self._idle_task.cancel()
