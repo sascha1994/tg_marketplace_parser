@@ -116,9 +116,23 @@ class DuplicateDB:
                 duplicates INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS stats_buckets (
+                bucket_ts INTEGER NOT NULL,
+                metric TEXT NOT NULL,
+                value INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket_ts, metric)
+            );
+            CREATE INDEX IF NOT EXISTS idx_stats_buckets_ts
+                ON stats_buckets(bucket_ts);
+            CREATE TABLE IF NOT EXISTS cascade_stats (
+                step TEXT PRIMARY KEY,
+                ok INTEGER NOT NULL DEFAULT 0,
+                fail INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
         self._migrate_publication_tables()
+        self._backfill_initial_stats_if_needed()
 
     def _migrate_publication_tables(self) -> None:
         scheduled_columns = {
@@ -664,6 +678,112 @@ class DuplicateDB:
             }
             for row in rows
         ]
+
+    # ---- Персистентная статистика по периодам и каскаду ----
+
+    def _backfill_initial_stats_if_needed(self) -> None:
+        """Однократно переносит уже накопленные исторические данные в stats_buckets при обновлении БД."""
+        if self.get_setting("stats_backfilled_v1", "") == "true":
+            return
+        has_any_stats = self._conn.execute("SELECT 1 FROM stats_buckets LIMIT 1").fetchone()
+        if not has_any_stats:
+            src_row = self._conn.execute(
+                "SELECT COALESCE(SUM(received), 0), COALESCE(SUM(published), 0), "
+                "COALESCE(SUM(rejected), 0), COALESCE(SUM(duplicates), 0), COALESCE(MAX(updated_at), 0) "
+                "FROM source_stats"
+            ).fetchone()
+            if src_row and any(src_row[:4]):
+                ts = int(src_row[4] or time.time())
+                if src_row[0] > 0:
+                    self.bump_stat("incoming", int(src_row[0]), timestamp=ts)
+                if src_row[1] > 0:
+                    self.bump_stat("published", int(src_row[1]), timestamp=ts)
+                if src_row[2] > 0:
+                    self.bump_stat("rejected", int(src_row[2]), timestamp=ts)
+                if src_row[3] > 0:
+                    self.bump_stat("duplicates", int(src_row[3]), timestamp=ts)
+
+            post_rows = self._conn.execute(
+                "SELECT status, published_at FROM published_posts WHERE status IN ('deleted', 'unavailable_marked')"
+            ).fetchall()
+            for status, pub_at in post_rows:
+                ts = int(pub_at or time.time())
+                if status == "deleted":
+                    self.bump_stat("posts_deleted", 1, timestamp=ts)
+                elif status == "unavailable_marked":
+                    self.bump_stat("posts_marked_unavailable", 1, timestamp=ts)
+        self.set_setting("stats_backfilled_v1", "true")
+
+    def bump_stat(self, metric: str, amount: int = 1, timestamp: float | None = None) -> None:
+        if amount <= 0 or not metric:
+            return
+        raw_ts = time.time() if timestamp is None else float(timestamp)
+        bucket_ts = (int(raw_ts) // 60) * 60
+        self._conn.execute(
+            "INSERT INTO stats_buckets(bucket_ts, metric, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(bucket_ts, metric) DO UPDATE SET value = value + excluded.value",
+            (bucket_ts, metric, int(amount)),
+        )
+
+    def get_stats(self, since_ts: int | None = None) -> dict[str, int]:
+        if since_ts is None:
+            rows = self._conn.execute(
+                "SELECT metric, COALESCE(SUM(value), 0) FROM stats_buckets GROUP BY metric"
+            ).fetchall()
+        else:
+            cutoff_bucket = (int(since_ts) // 60) * 60
+            rows = self._conn.execute(
+                "SELECT metric, COALESCE(SUM(value), 0) FROM stats_buckets "
+                "WHERE bucket_ts >= ? GROUP BY metric",
+                (cutoff_bucket,),
+            ).fetchall()
+        return {str(metric): int(total or 0) for metric, total in rows}
+
+    def bump_cascade_stat(self, step: str, success: bool) -> None:
+        if not step:
+            return
+        col = "ok" if success else "fail"
+        self._conn.execute(
+            f"INSERT INTO cascade_stats(step, {col}) VALUES (?, 1) "
+            f"ON CONFLICT(step) DO UPDATE SET {col} = {col} + 1",
+            (step,),
+        )
+
+    def get_cascade_stats(self) -> dict[str, list[int]]:
+        rows = self._conn.execute(
+            "SELECT step, ok, fail FROM cascade_stats ORDER BY step"
+        ).fetchall()
+        return {str(row[0]): [int(row[1] or 0), int(row[2] or 0)] for row in rows}
+
+    def get_last_published_at(self) -> float | None:
+        raw = self.get_setting("last_published_at", "")
+        if raw:
+            with suppress(TypeError, ValueError):
+                val = float(raw)
+                if val > 0:
+                    return val
+        row = self._conn.execute(
+            "SELECT MAX(published_at) FROM published_posts"
+        ).fetchone()
+        if row and row[0]:
+            return float(row[0])
+        seen_row = self._conn.execute(
+            "SELECT MAX(published_at) FROM seen_items WHERE status = 'published'"
+        ).fetchone()
+        if seen_row and seen_row[0]:
+            return float(seen_row[0])
+        return None
+
+    def set_last_published_at(self, timestamp: float) -> None:
+        self.set_setting("last_published_at", str(float(timestamp)))
+
+    def reset_stats(self) -> None:
+        """Обнуляет накопленную статистику, статистику источников и каскада, не затрагивая дедупликацию."""
+        self._conn.execute("DELETE FROM stats_buckets")
+        self._conn.execute("DELETE FROM cascade_stats")
+        self._conn.execute("DELETE FROM source_stats")
+        self._conn.execute("DELETE FROM app_settings WHERE key = 'last_published_at'")
+        self.set_setting("stats_backfilled_v1", "true")
 
     def close(self) -> None:
         with suppress(Exception):

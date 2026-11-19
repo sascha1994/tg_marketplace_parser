@@ -34,6 +34,7 @@ from .models import (
     Job,
     ProductCardData,
     ProductInfo,
+    record_stat,
 )
 from .presentation import (
     build_publication_text,
@@ -58,7 +59,7 @@ class PipelineMixin:
             self.db.set_cursor(event.chat_id, message.id)
         if self.state.is_paused:
             return
-        self.state.incoming += 1
+        record_stat(self, "incoming")
         if message.grouped_id:
             await self.collect_album(message, event.chat_id)
             return
@@ -116,8 +117,8 @@ class PipelineMixin:
                         "⚠️ Очередь парсера переполнена. Новые задания сохранены и будут обработаны позже."
                     )
                 return
-            self.state.queue_dropped += 1
-            self.state.errors += 1
+            record_stat(self, "queue_dropped")
+            record_stat(self, "errors")
             self.record_admin_error(f"Очередь переполнена: источник {job.source_chat_id}")
             log(f"Очередь переполнена; сообщение из {job.source_chat_id} пропущено", logging.ERROR)
             await self.notify_admin("⚠️ Очередь парсера переполнена. Одно сообщение пропущено.")
@@ -336,6 +337,7 @@ class PipelineMixin:
                     int(time.time()) + pause_seconds,
                     target_channel=target_channel,
                 )
+                record_stat(self, "scheduled_queued")
                 log(f"Публикация {product.platform} {product.sku} отложена до окончания перерыва")
                 return False
 
@@ -392,22 +394,28 @@ class PipelineMixin:
                     if len(message_ids) > 1:
                         await self.user_client.delete_messages(target_entity, message_ids[1:])
                     self.db.set_published_post_status(row["post_id"], "unavailable_marked")
+                    record_stat(self, "posts_marked_unavailable")
                     if is_price_increased and increase_pct is not None and card is not None:
+                        record_stat(self, "marked_price_up")
                         log(
                             f"Пост {product.platform} {product.sku} помечен как неактуальный: "
                             f"цена выросла на {increase_pct:.1f}% ({product.price_byn} -> {card.price_byn} BYN)"
                         )
                     else:
+                        record_stat(self, "marked_oos")
                         log(f"Пост {product.platform} {product.sku} помечен как неактуальный")
                 else:
                     await self.user_client.delete_messages(target_entity, message_ids)
                     self.db.set_published_post_status(row["post_id"], "deleted")
+                    record_stat(self, "posts_deleted")
                     if is_price_increased and increase_pct is not None and card is not None:
+                        record_stat(self, "deleted_price_up")
                         log(
                             f"Пост {product.platform} {product.sku} удалён: "
                             f"цена выросла на {increase_pct:.1f}% ({product.price_byn} -> {card.price_byn} BYN)"
                         )
                     else:
+                        record_stat(self, "deleted_oos")
                         log(f"Пост {product.platform} {product.sku} удалён: товара нет в наличии")
             else:
                 if card is not None and card.in_stock is True:
@@ -463,6 +471,9 @@ class PipelineMixin:
                 raise RuntimeError("карточка недоступна или проверка наличия не дала результата")
             if card.in_stock is False:
                 self.db.release_reservations([product.sku_key])
+                record_stat(self, "scheduled_cancelled")
+                record_stat(self, "out_of_stock")
+                record_stat(self, "filtered_out_of_stock")
                 log(f"Отложенная публикация отменена: {product.platform} {product.sku} отсутствует")
                 return
             if card.in_stock is not True:
@@ -474,6 +485,8 @@ class PipelineMixin:
                 and card.total_quantity < thresholds.wb_min_stock(self)
             ):
                 self.db.release_reservations([product.sku_key])
+                record_stat(self, "scheduled_cancelled")
+                record_stat(self, "filtered_wb_stock")
                 log(
                     f"Отложенная публикация WB {product.sku} отменена: "
                     f"остаток {card.total_quantity} (< {thresholds.wb_min_stock(self)})"
@@ -484,6 +497,7 @@ class PipelineMixin:
             if PipelineMixin.has_significant_price_increase(self, product, card):
                 increase_pct = PipelineMixin.get_price_increase_percent(self, product, card) or 0.0
                 self.db.release_reservations([product.sku_key])
+                record_stat(self, "scheduled_cancelled")
                 log(
                     f"Отложенная публикация {product.platform} {product.sku} отменена: "
                     f"цена выросла на {increase_pct:.1f}% ({product.price_byn} -> {card.price_byn} BYN)"
@@ -524,6 +538,8 @@ class PipelineMixin:
                 if discount is None:
                     raise RuntimeError("не найдена средняя цена для проверки скидки Ozon")
                 self.db.release_reservations([product.sku_key])
+                record_stat(self, "scheduled_cancelled")
+                record_stat(self, "filtered_ozon_discount")
                 log(
                     f"Отложенная публикация Ozon {product.sku} отменена: "
                     f"скидка {discount:.1f}% (< {thresholds.ozon_min_discount(self):g}%)"
@@ -539,8 +555,13 @@ class PipelineMixin:
                 row["target_channel"],
             )
             if published:
-                self.state.published += 1
-                self.state.last_published_at = time.time()
+                record_stat(self, "published")
+                now_ts = time.time()
+                if hasattr(self, "state") and self.state is not None:
+                    self.state.last_published_at = now_ts
+                if hasattr(self.db, "set_last_published_at"):
+                    with suppress(Exception):
+                        self.db.set_last_published_at(now_ts)
         except Exception as exc:
             attempts = row["attempts"] + 1
             if attempts >= thresholds.scheduled_max_attempts(self):
@@ -712,7 +733,8 @@ class PipelineMixin:
 
         candidate_links = list(dict.fromkeys(url for url in raw_links if validate_marketplace_url(url)))
         if not candidate_links:
-            self.state.rejected += 1
+            record_stat(self, "rejected")
+            record_stat(self, "rejected_no_links")
             self.bump_source(job, "rejected")
             self.record_job_result(job, "отклонено: нет ссылок на маркетплейсы")
             return
@@ -804,7 +826,8 @@ class PipelineMixin:
                 )
 
         if not products:
-            self.state.rejected += 1
+            record_stat(self, "rejected")
+            record_stat(self, "rejected_invalid_url")
             self.bump_source(job, "rejected")
             self.record_job_result(job, "отклонено: товар не определён")
             return
@@ -820,7 +843,7 @@ class PipelineMixin:
         source_message_id = min(message.id for message in job.messages)
         fresh_keys = self.db.reserve_fresh(products, job.source_chat_id, source_message_id)
         if not fresh_keys:
-            self.state.duplicates += 1
+            record_stat(self, "duplicates")
             self.bump_source(job, "duplicates")
             self.record_job_result(job, "дубликат")
             log(f"Все товары из сообщения {job.source_chat_id}/{source_message_id} уже обработаны")
@@ -845,6 +868,7 @@ class PipelineMixin:
         failed_keys: list[str] = []
         for orig_prod, enriched in zip(fresh_candidates, enriched_results, strict=False):
             if isinstance(enriched, Exception):
+                record_stat(self, "filtered_no_price")
                 log(
                     f"Ошибка парсинга карточки {orig_prod.platform} ({orig_prod.sku}): {enriched}",
                     logging.WARNING,
@@ -855,7 +879,20 @@ class PipelineMixin:
                 failed_keys.append(orig_prod.sku_key)
                 continue
             if enriched is None:
-                self.state.out_of_stock += 1
+                reason = (
+                    self._pop_enrichment_reject_reason(orig_prod.sku_key)
+                    if hasattr(self, "_pop_enrichment_reject_reason")
+                    else "out_of_stock"
+                )
+                if reason == "wb_stock":
+                    record_stat(self, "filtered_wb_stock")
+                elif reason == "no_price":
+                    record_stat(self, "filtered_no_price")
+                elif reason == "invalid_url":
+                    record_stat(self, "rejected_invalid_url")
+                else:
+                    record_stat(self, "out_of_stock")
+                    record_stat(self, "filtered_out_of_stock")
                 failed_keys.append(orig_prod.sku_key)
                 continue
             available_products.append(enriched)
@@ -875,6 +912,8 @@ class PipelineMixin:
         for product in available_products:
             block_reason = self.db.find_block_match(product.brand, product.title)
             if block_reason:
+                record_stat(self, "filtered_blocklist")
+                record_stat(self, "rejected")
                 log(
                     f"{product.platform} {product.sku}: публикация пропущена — "
                     f"чёрный список ({block_reason})"
@@ -883,6 +922,8 @@ class PipelineMixin:
                 blocked_count += 1
                 continue
             if product.platform == "Ozon" and not self.passes_ozon_discount_filter(product):
+                record_stat(self, "filtered_ozon_discount")
+                record_stat(self, "rejected")
                 discount = product.discount_percent
                 if discount is None:
                     log(
@@ -939,7 +980,7 @@ class PipelineMixin:
             except FloodWaitError as exc:
                 remaining = {item.sku_key for item in fresh_products[index:]}
                 self.db.release_reservations(remaining)
-                self.state.errors += 1
+                record_stat(self, "errors")
                 self.record_admin_error(f"FloodWait {exc.seconds} сек. для сообщения {source_message_id}")
                 log(f"FloodWait на {exc.seconds} сек. Товары освобождены", logging.ERROR)
                 if job.attempts < MAX_FLOOD_RETRIES:
@@ -962,7 +1003,7 @@ class PipelineMixin:
                 return
             except Exception as exc:
                 self.db.release_reservations([product.sku_key])
-                self.state.errors += 1
+                record_stat(self, "errors")
                 self.record_admin_error(
                     f"Публикация {job.source_chat_id}/{source_message_id}: {type(exc).__name__}: {exc}"
                 )
@@ -971,9 +1012,13 @@ class PipelineMixin:
                 continue
             if was_published:
                 published_count += 1
-                self.state.published += 1
+                record_stat(self, "published")
                 self.bump_source(job, "published")
-                self.state.last_published_at = time.time()
+                now_ts = time.time()
+                self.state.last_published_at = now_ts
+                if hasattr(self.db, "set_last_published_at"):
+                    with suppress(Exception):
+                        self.db.set_last_published_at(now_ts)
                 log(f"Опубликован товар {job.source_chat_id}/{source_message_id}: {product.sku_key}")
             else:
                 scheduled_count += 1
@@ -1056,7 +1101,7 @@ class PipelineMixin:
                     active = True
                     await self.process_job(job)
             except Exception as exc:
-                self.state.errors += 1
+                record_stat(self, "errors")
                 self.record_admin_error(
                     f"Worker {worker_number}: {type(exc).__name__}: {exc}"
                 )
