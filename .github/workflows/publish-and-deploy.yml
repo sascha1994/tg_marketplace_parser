@@ -4,12 +4,12 @@ on:
   push:
     branches:
       - main
-      - "release/**"
+    tags:
+      - "v*.*.*"
   pull_request:
     branches:
       - main
-      - "release/**"
-  workflow_dispatch:
+
 
 permissions:
   contents: read
@@ -43,59 +43,71 @@ jobs:
 
   publish:
     needs: test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
+    env:
+      IMAGE: ghcr.io/sascha1994/tg_marketplace_parser
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        with:
+          fetch-depth: 0
+      - name: Verify release version and ancestry
+        run: |
+          set -eu
+          [[ "$TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]
+          test "$TAG" = "v$(python -c 'from tg_marketplace_parser import __version__; print(__version__)')"
+          git merge-base --is-ancestor HEAD origin/main
+      - uses: docker/setup-buildx-action@v3
+      - name: Build release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: parser:release
+          cache-from: type=gha,scope=parser-image
+          cache-to: type=gha,mode=max,scope=parser-image
+      - name: Smoke test Chromium inside the release image
+        run: |
+          docker run --rm -i --network none parser:release python - <<'PY'
+          import parser
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          page_file = Path("/tmp/smoke.html")
+          page_file.write_text("<title>release smoke</title>")
+          with sync_playwright() as pw:
+              browser = pw.chromium.launch(channel="chromium")
+              page = browser.new_page()
+              page.goto(page_file.as_uri())
+              assert page.title() == "release smoke"
+              browser.close()
+          PY
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Prepare image tags
-        id: tags
-        shell: bash
+      - name: Publish tested image and release notes
         env:
-          REF: ${{ github.ref }}
-          SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          image="ghcr.io/sascha1994/tg_marketplace_parser"
-          {
-            echo "tags<<EOF"
-            echo "${image}:sha-${SHA}"
-            if [[ "$REF" == "refs/heads/main" ]]; then
-              echo "${image}:latest"
-            elif [[ "$REF" =~ ^refs/heads/release/v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-              echo "${image}:${BASH_REMATCH[1]}"
-              echo "${image}:stable"
-            else
-              echo "Unsupported publishing branch: $REF" >&2
-              exit 1
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-      - name: Build and publish image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=parser-image
-          cache-to: type=gha,mode=max,scope=parser-image
-      - name: Trigger Dockhand webhook
-        env:
-          DOCKHAND_WEBHOOK_URL: ${{ secrets.DOCKHAND_WEBHOOK_URL }}
-        run: |
-          if [ -n "$DOCKHAND_WEBHOOK_URL" ]; then
-            curl -fsSL -X POST "$DOCKHAND_WEBHOOK_URL"
-          else
-            echo "DOCKHAND_WEBHOOK_URL is not set, skipping webhook trigger."
+          set -eu
+          version="${TAG#v}"
+          ref="$IMAGE:$version"
+          if docker manifest inspect "$ref" > /dev/null 2>&1; then
+            echo "Version $version already exists" >&2
+            exit 1
           fi
+          docker tag parser:release "$ref"
+          docker tag parser:release "$IMAGE:sha-$GITHUB_SHA"
+          docker push "$ref"
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")
+          printf 'Image: `%s`\n' "$digest" > /tmp/release.md
+          if test -f "releases/$TAG.md"; then
+            cat "releases/$TAG.md" >> /tmp/release.md
+          fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes --notes-file /tmp/release.md

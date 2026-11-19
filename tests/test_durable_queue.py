@@ -190,6 +190,9 @@ class DurableQueueTests(unittest.IsolatedAsyncioTestCase):
         parser.queue = asyncio.Queue(maxsize=maxsize)
         parser.state = ParserState()
         parser._inflight_job_ids = set()
+        parser._restore_waiting = set()
+        parser._restore_backoff = {}
+        parser.retry_tasks = set()
         parser._overflow_pending = False
         parser.notify_admin = AsyncMock()
         parser.settings = SimpleNamespace(
@@ -256,6 +259,90 @@ class DurableQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.attempts, 1)
         self.assertEqual([message.id for message in job.messages], [4, 5])
         parser.user_client.get_messages.assert_awaited_once_with(10, ids=[4, 5])
+
+    async def test_failed_restore_retries_without_worker_or_new_message(self):
+        from telethon.errors import FloodWaitError
+
+        job_id = self.db.save_job(10, [4])
+        parser = self.make_parser()
+        parser.user_client = SimpleNamespace(get_messages=AsyncMock(side_effect=[
+            OSError("offline"), FloodWaitError(request=None, capture=35), [make_message(4)]
+        ]))
+        with patch("tg_marketplace_parser.pipeline.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            self.assertEqual(await parser.restore_pending_jobs(), 0)
+            await parser.restore_pending_jobs()
+            self.assertEqual(parser.user_client.get_messages.await_count, 1)
+            while parser.retry_tasks:
+                await asyncio.gather(*parser.retry_tasks)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [5, 36])
+        self.assertEqual(parser.queue.get_nowait().job_id, job_id)
+
+    async def test_paused_worker_preserves_job_across_restart(self):
+        parser = self.make_parser()
+        await parser.enqueue(Job([make_message(4)], 10))
+        parser.set_paused(True)
+        parser.process_job = AsyncMock()
+        worker = asyncio.create_task(parser.process_worker(1))
+        await asyncio.sleep(0)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        parser.process_job.assert_not_awaited()
+        restarted = self.make_parser()
+        restarted.state.is_paused = self.db.get_setting("paused", "") == "true"
+        self.assertTrue(restarted.state.is_paused)
+        restarted.user_client = SimpleNamespace(get_messages=AsyncMock(return_value=[make_message(4)]))
+        self.assertEqual(await restarted.restore_pending_jobs(), 1)
+        restarted.process_job = AsyncMock()
+        worker = asyncio.create_task(restarted.process_worker(2))
+        try:
+            await asyncio.sleep(0)
+            restarted.process_job.assert_not_awaited()
+            restarted.set_paused(False)
+            await asyncio.wait_for(restarted.queue.join(), timeout=1)
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        restarted.process_job.assert_awaited_once()
+        self.assertEqual(self.db.load_pending_jobs(), [])
+
+    async def test_cancelled_active_worker_keeps_pending_job(self):
+        parser = self.make_parser()
+        await parser.enqueue(Job([make_message(4)], 10))
+        started = asyncio.Event()
+
+        async def process(job):
+            started.set()
+            await asyncio.Event().wait()
+
+        parser.process_job = process
+        worker = asyncio.create_task(parser.process_worker(1))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        self.assertEqual(self.db.load_pending_jobs()[0]["message_ids"], [4])
+
+    async def test_worker_drains_501_restored_jobs_without_new_messages(self):
+        parser = self.make_parser(maxsize=500)
+        expected = [self.db.save_job(10, [i]) for i in range(1, 502)]
+        parser.user_client = SimpleNamespace(get_messages=AsyncMock(
+            side_effect=lambda chat_id, ids: [make_message(i) for i in ids]
+        ))
+        processed = []
+
+        async def process(job):
+            processed.append(job.job_id)
+
+        parser.process_job = process
+        self.assertEqual(await parser.restore_pending_jobs(), 500)
+        worker = asyncio.create_task(parser.process_worker(1))
+        try:
+            await asyncio.wait_for(parser.queue.join(), timeout=15)
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        self.assertEqual(processed, expected)
+        self.assertEqual(self.db.load_pending_jobs(), [])
+        self.assertEqual(parser.user_client.get_messages.await_count, 6)
 
     async def test_restore_drops_jobs_whose_messages_no_longer_exist(self):
         self.db.save_job(10, [4])
