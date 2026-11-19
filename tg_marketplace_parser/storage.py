@@ -519,6 +519,13 @@ class DuplicateDB:
         )
         return cursor.rowcount
 
+    def release_interrupted_reservations(self, chat_id: int, message_id: int) -> None:
+        self._conn.execute(
+            "DELETE FROM seen_items WHERE status = 'pending' AND source_chat_id = ? AND source_message_id = ? "
+            "AND sku_key NOT IN (SELECT sku_key FROM scheduled_publications)",
+            (chat_id, message_id),
+        )
+
     def release_reservations(self, sku_keys: Iterable[str]) -> None:
         keys = tuple(set(sku_keys))
         if not keys:

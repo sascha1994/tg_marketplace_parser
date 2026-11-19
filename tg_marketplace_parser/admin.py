@@ -820,11 +820,11 @@ class AdminMixin:
                 )
                 await event.answer()
             elif data == b"pause":
-                self.state.is_paused = True
+                self.set_paused(True)
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Пауза включена")
             elif data == b"resume":
-                self.state.is_paused = False
+                self.set_paused(False)
                 await event.edit(self.get_stats_text(), buttons=self.get_admin_keyboard())
                 await event.answer("Парсинг возобновлён")
             elif data == b"edit_schedule":

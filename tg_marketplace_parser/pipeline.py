@@ -46,6 +46,18 @@ from .presentation import (
 
 
 class PipelineMixin:
+    @cached_property
+    def _resume_event(self):
+        return asyncio.Event()
+
+    def set_paused(self, paused: bool) -> None:
+        self.db.set_setting("paused", "true" if paused else "false")
+        self.state.is_paused = paused
+        if paused:
+            self._resume_event.clear()
+        else:
+            self._resume_event.set()
+
     def record_job_result(self, job: Job, result: str, item_count: int = 0) -> None:
         message_id = min((message.id for message in job.messages), default=0)
         self.state.recent_jobs.append(
@@ -139,6 +151,21 @@ class PipelineMixin:
         async with self._restore_lock:
             return await self._restore_pending_pages()
 
+    def schedule_restore_retry(self, chat_id: int, exc: Exception) -> None:
+        delay = self._restore_backoff.get(chat_id, 5)
+        self._restore_backoff[chat_id] = min(delay * 2, 300)
+        if isinstance(exc, FloodWaitError):
+            delay = max(delay, exc.seconds + 1)
+        self._restore_waiting.add(chat_id)
+        task = asyncio.create_task(self._retry_restore(chat_id, delay))
+        self.retry_tasks.add(task)
+        task.add_done_callback(self.retry_tasks.discard)
+
+    async def _retry_restore(self, chat_id: int, delay: int) -> None:
+        await asyncio.sleep(delay)
+        self._restore_waiting.discard(chat_id)
+        await self.restore_pending_jobs()
+
     async def _restore_pending_pages(self) -> int:
         restored = 0
         after_id = 0
@@ -147,7 +174,8 @@ class PipelineMixin:
             if not rows:
                 break
             after_id = rows[-1]["job_id"]
-            pending = [row for row in rows if row["job_id"] not in self._inflight_job_ids]
+            pending = [row for row in rows if row["job_id"] not in self._inflight_job_ids
+                       and row["source_chat_id"] not in self._restore_waiting]
             capacity = self.queue.maxsize - self.queue.qsize()
             if len(pending) > capacity:
                 self._overflow_pending = True
@@ -168,8 +196,10 @@ class PipelineMixin:
                             fetched = [fetched]
                         found.update((msg.id, msg) for msg in fetched if msg)
                 except Exception as exc:
+                    self.schedule_restore_retry(chat_id, exc)
                     log(f"Не удалось восстановить задания чата {chat_id}: {exc}", logging.WARNING)
                     continue
+                self._restore_backoff.pop(chat_id, None)
                 messages_by_chat[chat_id] = found
             for row in pending:
                 job_id = row["job_id"]
@@ -1122,11 +1152,18 @@ class PipelineMixin:
         while True:
             job = await self.queue.get()
             active = False
+            finished = False
             try:
-                if not self.state.is_paused:
-                    self.state.active_jobs += 1
-                    active = True
-                    await self.process_job(job)
+                while self.state.is_paused:
+                    await self._resume_event.wait()
+                self.state.active_jobs += 1
+                active = True
+                await self.process_job(job)
+                finished = True
+            except asyncio.CancelledError:
+                if active and job.job_id is not None:
+                    self.db.release_interrupted_reservations(job.source_chat_id, min(m.id for m in job.messages))
+                raise
             except Exception as exc:
                 record_stat(self, "errors")
                 self.record_admin_error(
@@ -1139,11 +1176,12 @@ class PipelineMixin:
                 if active:
                     self.state.active_jobs -= 1
                 if job.job_id is not None and not job.retry_scheduled:
-                    with suppress(Exception):
-                        self.db.delete_job(job.job_id)
+                    if finished:
+                        with suppress(Exception):
+                            self.db.delete_job(job.job_id)
                     self._inflight_job_ids.discard(job.job_id)
                 self.queue.task_done()
-                if self._overflow_pending and not self.queue.full():
-                    self._overflow_pending = False
-                    with suppress(Exception):
-                        await self.restore_pending_jobs()
+            if self._overflow_pending and not self.queue.full():
+                self._overflow_pending = False
+                with suppress(Exception):
+                    await self.restore_pending_jobs()

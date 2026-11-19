@@ -23,7 +23,7 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self.user_client = TelegramClient(settings.user_session_path, settings.api_id, settings.api_hash)
         self.bot_client = TelegramClient(settings.bot_session_path, settings.api_id, settings.api_hash)
         self.db = DuplicateDB(settings.db_path, settings.cooldown_hours, settings.pending_ttl_minutes)
-        self.state = ParserState()
+        self.state = ParserState(is_paused=self.db.get_setting("paused", "false") == "true")
         self.restore_stats_from_db()
         self.http_session: aiohttp.ClientSession | None = None
         self.curl_session = None
@@ -39,6 +39,8 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self.heartbeat_task: asyncio.Task | None = None
         self._inflight_job_ids: set[int] = set()
         self._overflow_pending = False
+        self._restore_backoff: dict[int, int] = {}
+        self._restore_waiting: set[int] = set()
         self.resolve_semaphore = asyncio.Semaphore(8)
         self.publish_lock = asyncio.Lock()
         self.publication_gate_lock = asyncio.Lock()
