@@ -102,7 +102,7 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
             await cdp.send("Emulation.setUserAgentOverride", self._cdp_ua_metadata)
 
     async def _clear_ozon_cookies(self) -> None:
-        """Очищает антибот-cookies Ozon в контексте браузера и в дисковом кэше при блокировке 403."""
+        """Сбрасывает cookies браузера и сохраняет последний отклонённый кэш для диагностики."""
         if self._context is None:
             return
         with suppress(Exception):
@@ -110,9 +110,15 @@ class OzonBrowserResolver(OzonBrowserMixin, WildberriesBrowserMixin):
                 await self._context.clear_cookies(domain=re.compile(r"ozon\.", re.IGNORECASE))
             except TypeError:
                 await self._context.clear_cookies()
-        with suppress(OSError):
-            if os.path.isfile(self.settings.cookies_cache_path):
-                os.unlink(self.settings.cookies_cache_path)
+        path = self.settings.cookies_cache_path
+        try:
+            os.replace(path, f"{path}.rejected")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log(f"Не удалось переместить кэш cookies Ozon: {exc}", logging.WARNING)
+        else:
+            log(f"Последний отклонённый кэш cookies Ozon сохранён в {path}.rejected")
 
     async def _ensure_context(self) -> bool:
         if not self._available:

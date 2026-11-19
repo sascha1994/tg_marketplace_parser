@@ -3,6 +3,7 @@ import logging
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -36,6 +37,20 @@ class RefactoringStructureTests(unittest.TestCase):
     def test_browser_resolver_inherits_split_mixins(self):
         self.assertTrue(issubclass(OzonBrowserResolver, OzonBrowserMixin))
         self.assertTrue(issubclass(OzonBrowserResolver, WildberriesBrowserMixin))
+
+
+class CookieCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_cache_survives_repeated_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, "ozon_cookies.json")
+            original = b'[{"name":"example","value":"test"}]\n'
+            path.write_bytes(original)
+            resolver = OzonBrowserResolver(SimpleNamespace(use_browser_resolver=False, cookies_cache_path=str(path)))
+            resolver._context = AsyncMock()
+            await resolver._clear_ozon_cookies()
+            await resolver._clear_ozon_cookies()
+            self.assertFalse(path.exists())
+            self.assertEqual(Path(folder, "ozon_cookies.json.rejected").read_bytes(), original)
 
 
 class AdminAndObservabilityTests(unittest.IsolatedAsyncioTestCase):
