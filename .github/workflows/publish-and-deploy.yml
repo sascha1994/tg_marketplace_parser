@@ -111,3 +111,10 @@ jobs:
             cat "releases/$TAG.md" >> /tmp/release.md
           fi
           gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes --notes-file /tmp/release.md
+
+  stable:
+    needs: publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/promote-stable.yml
