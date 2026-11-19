@@ -105,7 +105,7 @@ jobs:
           docker tag parser:release "$IMAGE:sha-$GITHUB_SHA"
           docker push "$ref"
           docker push "$IMAGE:sha-$GITHUB_SHA"
-          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")
+          digest="$IMAGE@$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")"
           printf 'Image: `%s`\n' "$digest" > /tmp/release.md
           if test -f "releases/$TAG.md"; then
             cat "releases/$TAG.md" >> /tmp/release.md
