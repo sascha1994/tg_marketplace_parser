@@ -193,6 +193,14 @@ def record_stat(owner: object, metric: str, amount: int = 1, timestamp: float | 
             bump(metric, amount, timestamp=timestamp)
 
 
+def record_stats(owner: object, *metrics: str) -> None:
+    """Record related counters from one outcome with one atomic SQLite write."""
+    for metric in metrics:
+        setattr(owner.state, metric, getattr(owner.state, metric) + 1)
+    with suppress(Exception):
+        owner.db.bump_stats(metrics)
+
+
 def record_cascade(owner: object, step: str, success: bool) -> None:
     """Безопасно фиксирует результат шага каскада на объекте владельца (в памяти и БД)."""
     state = getattr(owner, "state", None)

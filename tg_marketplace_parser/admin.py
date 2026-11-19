@@ -149,6 +149,10 @@ class AdminMixin:
         return time.strftime("%d.%m %H:%M", time.localtime(last_ts))
 
     def get_stats_text(self) -> str:
+        with self.db.settings_snapshot():
+            return self._render_stats_text()
+
+    def _render_stats_text(self) -> str:
         uptime = int(time.time() - self.state.start_time)
         hours, remainder = divmod(uptime, 3600)
         minutes, seconds = divmod(remainder, 60)

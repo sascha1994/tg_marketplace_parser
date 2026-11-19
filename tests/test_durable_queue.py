@@ -257,6 +257,29 @@ class DurableQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([message.id for message in job.messages], [4, 5])
         parser.user_client.get_messages.assert_awaited_once_with(10, ids=[4, 5])
 
+    async def test_worker_drains_501_restored_jobs_without_new_messages(self):
+        parser = self.make_parser(maxsize=500)
+        expected = [self.db.save_job(10, [i]) for i in range(1, 502)]
+        parser.user_client = SimpleNamespace(get_messages=AsyncMock(
+            side_effect=lambda chat_id, ids: [make_message(i) for i in ids]
+        ))
+        processed = []
+
+        async def process(job):
+            processed.append(job.job_id)
+
+        parser.process_job = process
+        self.assertEqual(await parser.restore_pending_jobs(), 500)
+        worker = asyncio.create_task(parser.process_worker(1))
+        try:
+            await asyncio.wait_for(parser.queue.join(), timeout=15)
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        self.assertEqual(processed, expected)
+        self.assertEqual(self.db.load_pending_jobs(), [])
+        self.assertEqual(parser.user_client.get_messages.await_count, 6)
+
     async def test_restore_drops_jobs_whose_messages_no_longer_exist(self):
         self.db.save_job(10, [4])
         parser = self.make_parser()

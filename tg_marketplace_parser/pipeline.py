@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+from functools import cached_property
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, time as datetime_time, timedelta
@@ -35,6 +36,7 @@ from .models import (
     ProductCardData,
     ProductInfo,
     record_stat,
+    record_stats,
 )
 from .presentation import (
     build_publication_text,
@@ -117,8 +119,7 @@ class PipelineMixin:
                         "⚠️ Очередь парсера переполнена. Новые задания сохранены и будут обработаны позже."
                     )
                 return
-            record_stat(self, "queue_dropped")
-            record_stat(self, "errors")
+            record_stats(self, "queue_dropped", "errors")
             self.record_admin_error(f"Очередь переполнена: источник {job.source_chat_id}")
             log(f"Очередь переполнена; сообщение из {job.source_chat_id} пропущено", logging.ERROR)
             await self.notify_admin("⚠️ Очередь парсера переполнена. Одно сообщение пропущено.")
@@ -130,37 +131,66 @@ class PipelineMixin:
             self._inflight_job_ids.discard(job.job_id)
         await self.enqueue(job)
 
+    @cached_property
+    def _restore_lock(self):
+        return asyncio.Lock()
+
     async def restore_pending_jobs(self) -> int:
-        """Загружает сохранённые задания из БД в очередь (после рестарта или переполнения)."""
+        async with self._restore_lock:
+            return await self._restore_pending_pages()
+
+    async def _restore_pending_pages(self) -> int:
         restored = 0
-        for row in self.db.load_pending_jobs(limit=self.queue.maxsize):
-            if row["job_id"] in self._inflight_job_ids:
-                continue
-            if self.queue.full():
-                self._overflow_pending = True
+        after_id = 0
+        while True:
+            rows = self.db.load_pending_jobs(limit=100, after_id=after_id)
+            if not rows:
                 break
-            try:
-                fetched = await self.user_client.get_messages(
-                    row["source_chat_id"], ids=row["message_ids"]
-                )
-            except Exception as exc:
-                log(f"Не удалось восстановить задание {row['job_id']}: {type(exc).__name__}: {exc}", logging.WARNING)
-                continue
-            if not isinstance(fetched, list):
-                fetched = [fetched]
-            messages = [message for message in fetched if message]
-            if not messages:
-                self.db.delete_job(row["job_id"])
-                continue
-            job = Job(
-                messages=messages,
-                source_chat_id=row["source_chat_id"],
-                attempts=row["attempts"],
-                job_id=row["job_id"],
-            )
-            self.queue.put_nowait(job)
-            self._inflight_job_ids.add(row["job_id"])
-            restored += 1
+            after_id = rows[-1]["job_id"]
+            pending = [row for row in rows if row["job_id"] not in self._inflight_job_ids]
+            capacity = self.queue.maxsize - self.queue.qsize()
+            if len(pending) > capacity:
+                self._overflow_pending = True
+                pending = pending[:capacity]
+                if pending:
+                    after_id = pending[-1]["job_id"]
+            ids_by_chat = {}
+            for row in pending:
+                ids_by_chat.setdefault(row["source_chat_id"], []).extend(row["message_ids"])
+            messages_by_chat = {}
+            for chat_id, ids in ids_by_chat.items():
+                found = {}
+                unique_ids = list(dict.fromkeys(ids))
+                try:
+                    for start in range(0, len(unique_ids), 100):
+                        fetched = await self.user_client.get_messages(chat_id, ids=unique_ids[start:start + 100])
+                        if not isinstance(fetched, list):
+                            fetched = [fetched]
+                        found.update((msg.id, msg) for msg in fetched if msg)
+                except Exception as exc:
+                    log(f"Не удалось восстановить задания чата {chat_id}: {exc}", logging.WARNING)
+                    continue
+                messages_by_chat[chat_id] = found
+            for row in pending:
+                job_id = row["job_id"]
+                found = messages_by_chat.get(row["source_chat_id"])
+                if found is None or job_id in self._inflight_job_ids:
+                    continue
+                messages = [found[mid] for mid in row["message_ids"] if mid in found]
+                if not messages:
+                    self.db.delete_job(job_id)
+                    continue
+                if self.queue.full():
+                    self._overflow_pending = True
+                    break
+                self.queue.put_nowait(Job(messages, row["source_chat_id"], attempts=row["attempts"],
+                                          job_id=job_id, target_channel=row["target_channel"]))
+                self._inflight_job_ids.add(job_id)
+                restored += 1
+            if self.queue.full():
+                if self.db.load_pending_jobs(limit=1, after_id=after_id):
+                    self._overflow_pending = True
+                break
         self.state.recovered_jobs += restored
         if restored:
             log(f"Восстановлено заданий из БД: {restored}")
@@ -471,9 +501,7 @@ class PipelineMixin:
                 raise RuntimeError("карточка недоступна или проверка наличия не дала результата")
             if card.in_stock is False:
                 self.db.release_reservations([product.sku_key])
-                record_stat(self, "scheduled_cancelled")
-                record_stat(self, "out_of_stock")
-                record_stat(self, "filtered_out_of_stock")
+                record_stats(self, "scheduled_cancelled", "out_of_stock", "filtered_out_of_stock")
                 log(f"Отложенная публикация отменена: {product.platform} {product.sku} отсутствует")
                 return
             if card.in_stock is not True:
@@ -485,8 +513,7 @@ class PipelineMixin:
                 and card.total_quantity < thresholds.wb_min_stock(self)
             ):
                 self.db.release_reservations([product.sku_key])
-                record_stat(self, "scheduled_cancelled")
-                record_stat(self, "filtered_wb_stock")
+                record_stats(self, "scheduled_cancelled", "filtered_wb_stock")
                 log(
                     f"Отложенная публикация WB {product.sku} отменена: "
                     f"остаток {card.total_quantity} (< {thresholds.wb_min_stock(self)})"
@@ -538,8 +565,7 @@ class PipelineMixin:
                 if discount is None:
                     raise RuntimeError("не найдена средняя цена для проверки скидки Ozon")
                 self.db.release_reservations([product.sku_key])
-                record_stat(self, "scheduled_cancelled")
-                record_stat(self, "filtered_ozon_discount")
+                record_stats(self, "scheduled_cancelled", "filtered_ozon_discount")
                 log(
                     f"Отложенная публикация Ozon {product.sku} отменена: "
                     f"скидка {discount:.1f}% (< {thresholds.ozon_min_discount(self):g}%)"
@@ -599,10 +625,13 @@ class PipelineMixin:
             self.record_admin_error(f"{batch_error_label}: {type(exc).__name__}: {exc}")
             log(f"Ошибка ({batch_error_label}): {exc}", logging.WARNING)
 
+        fallback_start = time.monotonic()
+        fallback_count = 0
         results: list[tuple[dict, ProductInfo, ProductCardData | None]] = []
         for row, product in zip(wb_rows, products, strict=False):
             card = cards.get(product.sku or "")
             if card is None or card.in_stock is None:
+                fallback_count += 1
                 try:
                     kwargs = {"source_text": row.get("source_text", "")} if include_source_text else {}
                     card = await self.resolve_wb_batch_card(product, card, **kwargs)
@@ -616,6 +645,9 @@ class PipelineMixin:
                         logging.WARNING,
                     )
             results.append((row, product, card))
+        if fallback_count:
+            log(f"Индивидуальные проверки WB: {fallback_count}/{len(products)}, "
+                f"время {time.monotonic() - fallback_start:.2f} с")
         return results
 
     async def run_scheduled_publication_step(self, now: int | None = None) -> float:
@@ -733,8 +765,7 @@ class PipelineMixin:
 
         candidate_links = list(dict.fromkeys(url for url in raw_links if validate_marketplace_url(url)))
         if not candidate_links:
-            record_stat(self, "rejected")
-            record_stat(self, "rejected_no_links")
+            record_stats(self, "rejected", "rejected_no_links")
             self.bump_source(job, "rejected")
             self.record_job_result(job, "отклонено: нет ссылок на маркетплейсы")
             return
@@ -826,8 +857,7 @@ class PipelineMixin:
                 )
 
         if not products:
-            record_stat(self, "rejected")
-            record_stat(self, "rejected_invalid_url")
+            record_stats(self, "rejected", "rejected_invalid_url")
             self.bump_source(job, "rejected")
             self.record_job_result(job, "отклонено: товар не определён")
             return
@@ -891,8 +921,7 @@ class PipelineMixin:
                 elif reason == "invalid_url":
                     record_stat(self, "rejected_invalid_url")
                 else:
-                    record_stat(self, "out_of_stock")
-                    record_stat(self, "filtered_out_of_stock")
+                    record_stats(self, "out_of_stock", "filtered_out_of_stock")
                 failed_keys.append(orig_prod.sku_key)
                 continue
             available_products.append(enriched)
@@ -912,8 +941,7 @@ class PipelineMixin:
         for product in available_products:
             block_reason = self.db.find_block_match(product.brand, product.title)
             if block_reason:
-                record_stat(self, "filtered_blocklist")
-                record_stat(self, "rejected")
+                record_stats(self, "filtered_blocklist", "rejected")
                 log(
                     f"{product.platform} {product.sku}: публикация пропущена — "
                     f"чёрный список ({block_reason})"
@@ -922,8 +950,7 @@ class PipelineMixin:
                 blocked_count += 1
                 continue
             if product.platform == "Ozon" and not self.passes_ozon_discount_filter(product):
-                record_stat(self, "filtered_ozon_discount")
-                record_stat(self, "rejected")
+                record_stats(self, "filtered_ozon_discount", "rejected")
                 discount = product.discount_percent
                 if discount is None:
                     log(

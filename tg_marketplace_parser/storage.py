@@ -2,7 +2,7 @@ import json
 import sqlite3
 import time
 from dataclasses import asdict
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import Iterable
 
 from .constants import (
@@ -20,7 +20,9 @@ class DuplicateDB:
         self.cooldown_seconds = cooldown_hours * 3600
         self.pending_ttl_seconds = pending_ttl_minutes * 60
         self._conn = self._connect()
+        self._settings_snapshot: dict[str, str] | None = None
         self._init_db()
+        self._reload_block_rules()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -306,7 +308,19 @@ class DuplicateDB:
             (now, *keys),
         )
 
+    @contextmanager
+    def settings_snapshot(self):
+        """Read settings once for a synchronous dashboard render."""
+        previous = self._settings_snapshot
+        self._settings_snapshot = dict(self._conn.execute("SELECT key, value FROM app_settings"))
+        try:
+            yield
+        finally:
+            self._settings_snapshot = previous
+
     def get_setting(self, key: str, default: str) -> str:
+        if self._settings_snapshot is not None:
+            return self._settings_snapshot.get(key, default)
         row = self._conn.execute(
             "SELECT value FROM app_settings WHERE key = ?",
             (key,),
@@ -563,11 +577,11 @@ class DuplicateDB:
     def delete_job(self, job_id: int) -> None:
         self._conn.execute("DELETE FROM pending_jobs WHERE job_id = ?", (job_id,))
 
-    def load_pending_jobs(self, limit: int = 500) -> list[dict]:
+    def load_pending_jobs(self, limit: int = 500, after_id: int = 0) -> list[dict]:
         rows = self._conn.execute(
             "SELECT job_id, source_chat_id, message_ids, target_channel, attempts "
-            "FROM pending_jobs ORDER BY job_id LIMIT ?",
-            (limit,),
+            "FROM pending_jobs WHERE job_id > ? ORDER BY job_id LIMIT ?",
+            (after_id, limit),
         ).fetchall()
         jobs: list[dict] = []
         for row in rows:
@@ -623,6 +637,8 @@ class DuplicateDB:
             "INSERT OR IGNORE INTO blocklist(kind, value) VALUES (?, ?)",
             (kind, normalized),
         )
+        if cursor.rowcount:
+            self._reload_block_rules()
         return cursor.rowcount > 0
 
     def remove_block(self, kind: str, value: str) -> bool:
@@ -631,6 +647,8 @@ class DuplicateDB:
             "DELETE FROM blocklist WHERE kind = ? AND value = ?",
             (kind, normalized),
         )
+        if cursor.rowcount:
+            self._reload_block_rules()
         return cursor.rowcount > 0
 
     def list_blocks(self) -> list[tuple[str, str]]:
@@ -639,14 +657,19 @@ class DuplicateDB:
         ).fetchall()
         return [(row[0], row[1]) for row in rows]
 
+    def _reload_block_rules(self) -> None:
+        rules = self.list_blocks()
+        self._blocked_brands = {value for kind, value in rules if kind == "brand"}
+        self._blocked_keywords = [value for kind, value in rules if kind == "keyword"]
+
     def find_block_match(self, brand: str, title: str) -> str | None:
         """Возвращает описание сработавшего правила чёрного списка или None."""
         brand_text = " ".join((brand or "").casefold().split())
         haystack = " ".join(f"{brand} {title}".casefold().split())
-        for kind, value in self.list_blocks():
-            if kind == "brand" and brand_text and value == brand_text:
-                return f"бренд «{value}»"
-            if kind == "keyword" and value in haystack:
+        if brand_text in self._blocked_brands:
+            return f"бренд «{brand_text}»"
+        for value in self._blocked_keywords:
+            if value in haystack:
                 return f"слово «{value}»"
         return None
 
@@ -717,12 +740,18 @@ class DuplicateDB:
     def bump_stat(self, metric: str, amount: int = 1, timestamp: float | None = None) -> None:
         if amount <= 0 or not metric:
             return
+        self.bump_stats((metric,), amount, timestamp)
+
+    def bump_stats(self, metrics: tuple[str, ...], amount: int = 1, timestamp: float | None = None) -> None:
+        if not metrics or amount <= 0:
+            return
         raw_ts = time.time() if timestamp is None else float(timestamp)
         bucket_ts = (int(raw_ts) // 60) * 60
+        placeholders = ", ".join("(?, ?, ?)" for _ in metrics)
         self._conn.execute(
-            "INSERT INTO stats_buckets(bucket_ts, metric, value) VALUES (?, ?, ?) "
+            f"INSERT INTO stats_buckets(bucket_ts, metric, value) VALUES {placeholders} "
             "ON CONFLICT(bucket_ts, metric) DO UPDATE SET value = value + excluded.value",
-            (bucket_ts, metric, int(amount)),
+            [value for metric in metrics for value in (bucket_ts, metric, int(amount))],
         )
 
     def get_stats(self, since_ts: int | None = None) -> dict[str, int]:
