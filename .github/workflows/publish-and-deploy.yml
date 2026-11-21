@@ -1,101 +1,45 @@
-name: Test and publish image
+name: Publish 1.0.7 admin backport
 
 on:
   push:
-    branches:
-      - main
-      - "release/**"
-  pull_request:
-    branches:
-      - main
-      - "release/**"
-  workflow_dispatch:
+    tags:
+      - 'v1.0.7-admin.*'
 
 permissions:
   contents: read
 
-concurrency:
-  group: parser-image-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-      - name: Install dependencies
-        run: python -m pip install -r requirements-dev.txt
-      - name: Run ruff linter
-        run: python -m ruff check .
-      - name: Run mypy type check
-        run: python -m mypy tg_marketplace_parser
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-      - name: Compile Python files
-        run: python -m compileall -q tg_marketplace_parser tests
-
   publish:
-    needs: test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    env:
+      IMAGE: ghcr.io/sascha1994/tg_marketplace_parser
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Build backport from pinned runtime
+        run: |
+          set -eu
+          [[ "$TAG" =~ ^v1\.0\.7-admin\.[0-9]+$ ]]
+          docker build -t parser-admin:test .
+      - name: Test packaged admin with original dependencies
+        run: |
+          docker run --rm --network none parser-admin:test python -c "import parser; from importlib.metadata import version; assert version('playwright') == '1.64.1'"
+          docker run --rm --network none -v "$PWD/tests:/app/tests:ro" parser-admin:test python -m unittest discover -s tests -q
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Prepare image tags
-        id: tags
-        shell: bash
-        env:
-          REF: ${{ github.ref }}
-          SHA: ${{ github.sha }}
+      - name: Publish versioned image
         run: |
-          image="ghcr.io/sascha1994/tg_marketplace_parser"
-          {
-            echo "tags<<EOF"
-            echo "${image}:sha-${SHA}"
-            if [[ "$REF" == "refs/heads/main" ]]; then
-              echo "${image}:latest"
-            elif [[ "$REF" =~ ^refs/heads/release/v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-              echo "${image}:${BASH_REMATCH[1]}"
-              echo "${image}:stable"
-            else
-              echo "Unsupported publishing branch: $REF" >&2
-              exit 1
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-      - name: Build and publish image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=parser-image
-          cache-to: type=gha,mode=max,scope=parser-image
-      - name: Trigger Dockhand webhook
-        env:
-          DOCKHAND_WEBHOOK_URL: ${{ secrets.DOCKHAND_WEBHOOK_URL }}
-        run: |
-          if [ -n "$DOCKHAND_WEBHOOK_URL" ]; then
-            curl -fsSL -X POST "$DOCKHAND_WEBHOOK_URL"
-          else
-            echo "DOCKHAND_WEBHOOK_URL is not set, skipping webhook trigger."
+          set -eu
+          ref="$IMAGE:${TAG#v}"
+          if docker manifest inspect "$ref" > /dev/null 2>&1; then
+            echo "Image already exists: $ref" >&2
+            exit 1
           fi
+          docker tag parser-admin:test "$ref"
+          docker push "$ref"
