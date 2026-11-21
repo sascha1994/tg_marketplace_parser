@@ -24,6 +24,7 @@ class ParserApp(SourcesMixin, MarketDataMixin, PipelineMixin, AdminMixin, Runtim
         self.bot_client = TelegramClient(settings.bot_session_path, settings.api_id, settings.api_hash)
         self.db = DuplicateDB(settings.db_path, settings.cooldown_hours, settings.pending_ttl_minutes)
         self.state = ParserState()
+        self.restore_stats_from_db()
         self.http_session: aiohttp.ClientSession | None = None
         self.curl_session = None
         self.browser_resolver = OzonBrowserResolver(settings)

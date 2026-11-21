@@ -128,7 +128,7 @@ class RuntimeMixin:
             self.heartbeat_task = asyncio.create_task(self.heartbeat_worker(), name="heartbeat")
             await self.bot_client.send_message(
                 self.settings.admin_id,
-                "🟢 Парсер запущен и слушает источники.",
+                self.get_stats_text(),
                 buttons=self.get_admin_keyboard(),
             )
             await asyncio.gather(

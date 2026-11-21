@@ -360,7 +360,7 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         main_keyboard = AdminMixin.get_admin_keyboard(admin)
-        self.assertEqual(len(main_keyboard), 5)
+        self.assertEqual(len(main_keyboard), 4)
         schedule_keyboard = AdminMixin.get_schedule_keyboard(admin)
         button = next(
             button
