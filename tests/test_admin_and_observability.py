@@ -40,6 +40,27 @@ class RefactoringStructureTests(unittest.TestCase):
 
 
 class CookieCacheTests(unittest.IsolatedAsyncioTestCase):
+    def test_startup_cache_diagnostics(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
+            path = Path(folder, "cookies.json")
+            owner = SimpleNamespace(
+                settings=SimpleNamespace(cookies_cache_path=path, wb_baskets_cache_path=Path(folder, "wb.json")),
+                _sync_cookies_to_http_clients=lambda records: None,
+            )
+            for content, expected in [
+                (None, "отсутствует"),
+                ("{secret", "JSONDecodeError"),
+                ('[{"name":123,"value":"secret"}]', "Неверная структура"),
+                ('[{"name":"example","value":"secret"}]', "Прочитано записей из файла кэша cookies: 1"),
+            ]:
+                with self.subTest(expected=expected), patch("tg_marketplace_parser.http_client.log") as logger:
+                    if content is not None:
+                        path.write_text(content, encoding="utf-8")
+                    HttpClientMixin._load_cached_cookies_from_disk(owner)
+                    logger.assert_called_once()
+                    self.assertIn(expected, logger.call_args.args[0])
+                    self.assertNotIn("secret", str(logger.call_args))
+
     async def test_rejected_cache_survives_repeated_cleanup(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder, "ozon_cookies.json")
@@ -456,6 +477,7 @@ class AdminAndObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("wb_card_api", restarted_admin.state.cascade_stats)
 
         main_text = restarted_admin.get_stats_text()
+        self.assertIn("Записей cookies при последней синхронизации HTTP: 12", main_text)
         self.assertIn("Активные правила:", main_text)
         self.assertIn("Сводка (всего / за день):", main_text)
         self.assertIn("Снято постов: 4 (удалено: 3 · неактуально: 1)", main_text)

@@ -214,7 +214,8 @@ class AdminMixin:
             f"• Отсеяно: дубли {all_s['duplicates']} · фильтры {filtered_cards} · отклонено {all_s['rejected']}\n"
             f"• Ошибок: {all_s['errors']} · Переполнений: {all_s['queue_dropped']}\n\n"
             f"🛡 Антибот и БД:\n"
-            f"• Браузер (Playwright): {browser_state} · Cookies: {self.synced_cookie_count}\n"
+            f"• Браузер (Playwright): {browser_state}\n"
+            f"• Записей cookies при последней синхронизации HTTP: {self.synced_cookie_count}\n"
             f"• Раскрыто: HTTP/curl {all_s['http_resolved']} · Браузер {all_s['browser_resolved']} · Карточек: {all_s['cards_parsed']}\n"
             f"• SKU в БД — опубликовано: {published_db}, pending: {pending_db}"
         )

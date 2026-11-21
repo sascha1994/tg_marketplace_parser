@@ -104,13 +104,25 @@ class HttpClientMixin:
                     wb_list.append({"name": k.strip(), "value": v.strip(), "domain": "wildberries.by"})
             self._sync_cookies_to_http_clients(wb_list)
 
-        if os.path.isfile(self.settings.cookies_cache_path):
-            with suppress(Exception):
-                with open(self.settings.cookies_cache_path, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                if isinstance(cached, list) and cached:
-                    self._sync_cookies_to_http_clients(cached)
-                    log(f"Загружено {len(cached)} кэшированных антибот-cookies с диска")
+        try:
+            with open(self.settings.cookies_cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+        except FileNotFoundError:
+            log("При запуске файл кэша cookies отсутствует")
+        except (OSError, ValueError) as exc:
+            log(f"Не удалось прочитать кэш cookies: {type(exc).__name__}", logging.WARNING)
+        else:
+            if isinstance(cached, list) and all(
+                isinstance(entry, dict)
+                and isinstance(entry.get("name"), str)
+                and isinstance(entry.get("value"), str)
+                and isinstance(entry.get("domain", ""), str)
+                for entry in cached
+            ):
+                self._sync_cookies_to_http_clients(cached)
+                log(f"Прочитано записей из файла кэша cookies: {len(cached)}")
+            else:
+                log("Неверная структура файла кэша cookies", logging.WARNING)
 
         if os.path.isfile(self.settings.wb_baskets_cache_path):
             with suppress(Exception):
