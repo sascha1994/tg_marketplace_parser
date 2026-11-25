@@ -1,0 +1,14 @@
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Тестовая лампа настольная",
+  "brand": {"@type": "Brand", "name": "Lumo"},
+  "image": ["https://ir.ozone.ru/s3/multimedia-1/wc200/1000000001.jpg"],
+  "aggregateRating": {"ratingValue": "4,8", "reviewCount": 120},
+  "offers": {
+    "@type": "Offer",
+    "price": 49.99,
+    "priceCurrency": "BYN",
+    "availability": "https://schema.org/InStock"
+  }
+}

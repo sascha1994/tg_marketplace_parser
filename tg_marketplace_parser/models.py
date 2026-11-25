@@ -1,0 +1,222 @@
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass, field
+import time
+
+@dataclass(frozen=True)
+class ProductCardData:
+    title: str = ""
+    brand: str = ""
+    price_byn: float | None = None
+    avg_month_price_byn: float | None = None
+    old_price_byn: float | None = None
+    image_url: str = ""
+    in_stock: bool | None = None
+    total_quantity: int | None = None
+    rating: float | None = None
+    reviews_count: int | None = None
+    raw_currency: str = "BYN"
+    price_source: str = "live"
+    category: str = ""
+
+@dataclass(frozen=True)
+class ProductInfo:
+    original_url: str
+    resolved_url: str
+    platform: str
+    sku: str | None
+    canonical_url: str
+    sku_key: str
+    title: str = ""
+    brand: str = ""
+    price_byn: float | None = None
+    avg_month_price_byn: float | None = None
+    old_price_byn: float | None = None
+    image_url: str = ""
+    in_stock: bool = True
+    total_quantity: int | None = None
+    rating: float | None = None
+    reviews_count: int | None = None
+    price_source: str = "live"
+    category: str = ""
+
+    @property
+    def display_title(self) -> str:
+        from .common import clean_product_title
+
+        cleaned = clean_product_title(self.title, self.brand)
+        if cleaned:
+            return cleaned
+        return f"Товар {self.platform}"
+
+    @property
+    def formatted_price_byn(self) -> str | None:
+        from .pricing import format_byn_price
+
+        return format_byn_price(self.price_byn)
+
+    @property
+    def formatted_avg_month_price_byn(self) -> str | None:
+        from .pricing import format_byn_price
+
+        if (
+            self.avg_month_price_byn is not None
+            and self.price_byn is not None
+            and self.avg_month_price_byn > self.price_byn * 1.01
+        ):
+            return format_byn_price(self.avg_month_price_byn)
+        return None
+
+    @property
+    def formatted_old_price_byn(self) -> str | None:
+        from .pricing import format_byn_price
+
+        if (
+            self.old_price_byn is not None
+            and self.price_byn is not None
+            and self.old_price_byn > self.price_byn * 1.02
+        ):
+            return format_byn_price(self.old_price_byn)
+        return None
+
+    @property
+    def discount_percent(self) -> float | None:
+        if (
+            self.avg_month_price_byn is None
+            or self.avg_month_price_byn <= 0
+            or self.price_byn is None
+            or self.price_byn <= 0
+        ):
+            return None
+        return (self.avg_month_price_byn - self.price_byn) * 100 / self.avg_month_price_byn
+
+@dataclass
+class Job:
+    messages: list
+    source_chat_id: int
+    attempts: int = 0
+    target_channel: str | None = None
+    job_id: int | None = None
+    retry_scheduled: bool = False
+
+
+@dataclass
+class ParserState:
+    is_paused: bool = False
+    start_time: float = field(default_factory=time.time)
+    incoming: int = 0
+    published: int = 0
+    duplicates: int = 0
+    out_of_stock: int = 0
+    rejected: int = 0
+    errors: int = 0
+    queue_dropped: int = 0
+    browser_resolved: int = 0
+    http_resolved: int = 0
+    saved_resolutions: dict[str, int] = field(default_factory=dict)
+    cards_parsed: int = 0
+    active_jobs: int = 0
+    recovered_jobs: int = 0
+    caught_up_posts: int = 0
+    # Детализация отсева по фильтрам и причинам
+    filtered_out_of_stock: int = 0
+    filtered_wb_stock: int = 0
+    filtered_ozon_discount: int = 0
+    filtered_blocklist: int = 0
+    filtered_no_price: int = 0
+    rejected_no_links: int = 0
+    rejected_invalid_url: int = 0
+    # Жизненный цикл опубликованных и отложенных постов
+    posts_deleted: int = 0
+    deleted_oos: int = 0
+    deleted_price_up: int = 0
+    posts_marked_unavailable: int = 0
+    marked_oos: int = 0
+    marked_price_up: int = 0
+    forum_posts_deleted: int = 0
+    forum_deleted_oos: int = 0
+    forum_deleted_price_up: int = 0
+    forum_posts_marked_unavailable: int = 0
+    forum_marked_oos: int = 0
+    forum_marked_price_up: int = 0
+    scheduled_queued: int = 0
+    scheduled_cancelled: int = 0
+    last_published_at: float | None = None
+    recent_jobs: deque = field(default_factory=lambda: deque(maxlen=15))
+    recent_errors: deque = field(default_factory=lambda: deque(maxlen=10))
+    cascade_stats: dict = field(default_factory=dict)
+
+    def record_cascade(self, step: str, success: bool) -> None:
+        """Считает успехи и неудачи шага каскада получения данных карточки."""
+        counters = self.cascade_stats.setdefault(step, [0, 0])
+        counters[0 if success else 1] += 1
+
+    def reset_counters(self) -> None:
+        """Обнуляет накопительные счётчики статистики в памяти."""
+        for attr in (
+            "incoming",
+            "published",
+            "duplicates",
+            "out_of_stock",
+            "rejected",
+            "errors",
+            "queue_dropped",
+            "browser_resolved",
+            "http_resolved",
+            "cards_parsed",
+            "filtered_out_of_stock",
+            "filtered_wb_stock",
+            "filtered_ozon_discount",
+            "filtered_blocklist",
+            "filtered_no_price",
+            "rejected_no_links",
+            "rejected_invalid_url",
+            "posts_deleted",
+            "deleted_oos",
+            "deleted_price_up",
+            "posts_marked_unavailable",
+            "marked_oos",
+            "marked_price_up",
+            "forum_posts_deleted",
+            "forum_deleted_oos",
+            "forum_deleted_price_up",
+            "forum_posts_marked_unavailable",
+            "forum_marked_oos",
+            "forum_marked_price_up",
+            "scheduled_queued",
+            "scheduled_cancelled",
+        ):
+            setattr(self, attr, 0)
+        self.last_published_at = None
+        self.saved_resolutions.clear()
+        self.cascade_stats.clear()
+        self.recent_jobs.clear()
+        self.recent_errors.clear()
+
+
+def record_stat(owner: object, metric: str, amount: int = 1, timestamp: float | None = None) -> None:
+    """Безопасно увеличивает счётчик статистики в памяти (ParserState) и в БД (DuplicateDB)."""
+    if amount <= 0:
+        return
+    state = getattr(owner, "state", None)
+    if state is not None and hasattr(state, metric):
+        with suppress(Exception):
+            setattr(state, metric, getattr(state, metric) + amount)
+    db = getattr(owner, "db", None)
+    bump = getattr(db, "bump_stat", None)
+    if callable(bump):
+        with suppress(Exception):
+            bump(metric, amount, timestamp=timestamp)
+
+
+def record_cascade(owner: object, step: str, success: bool) -> None:
+    """Безопасно фиксирует результат шага каскада на объекте владельца (в памяти и БД)."""
+    state = getattr(owner, "state", None)
+    recorder = getattr(state, "record_cascade", None)
+    if callable(recorder):
+        recorder(step, success)
+    db = getattr(owner, "db", None)
+    bump_cascade = getattr(db, "bump_cascade_stat", None)
+    if callable(bump_cascade):
+        with suppress(Exception):
+            bump_cascade(step, success)

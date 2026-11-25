@@ -1,0 +1,24 @@
+services:
+  tg_deals_parser_dev:
+    image: ghcr.io/sascha1994/tg_marketplace_parser:dev
+    pull_policy: always
+    container_name: tg_deals_parser_dev
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    shm_size: "1gb"
+    env_file:
+      - .env
+    volumes:
+      - ${PARSER_DATA_DIR:-./data-dev}:/app/data
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

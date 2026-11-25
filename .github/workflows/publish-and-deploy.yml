@@ -1,0 +1,142 @@
+name: Test and publish image
+
+on:
+  push:
+    branches:
+      - dev
+      - releases
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - dev
+      - releases
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parser-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t parser:test .
+      - name: Verify packaged runtime and run unit tests
+        run: |
+          docker run --rm --network none parser:test python -c "import parser; from importlib.metadata import version; assert version('playwright') == '1.64.1'"
+          docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD/tests:/app/tests:ro" parser:test python -m unittest discover -s tests -q
+          docker run --rm --network none parser:test python -m compileall -q tg_marketplace_parser
+
+  publish-dev:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/sascha1994/tg_marketplace_parser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build dev image
+        run: |
+          set -eu
+          version="$(python3 -c 'from tg_marketplace_parser import __version__; print(__version__)')"
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          docker build \
+            --build-arg "IMAGE_VERSION=${version}-dev" \
+            --build-arg "IMAGE_REVISION=${GITHUB_SHA}" \
+            --build-arg "IMAGE_CREATED=${created}" \
+            -t parser:dev .
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish dev image
+        run: |
+          set -eu
+          docker tag parser:dev "$IMAGE:dev"
+          docker tag parser:dev "$IMAGE:dev-sha-$GITHUB_SHA"
+          docker push "$IMAGE:dev"
+          docker push "$IMAGE:dev-sha-$GITHUB_SHA"
+
+  publish:
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/releases' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/sascha1994/tg_marketplace_parser
+      REF_NAME: ${{ github.ref_name }}
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve and verify release version
+        id: meta
+        run: |
+          set -eu
+          version="$(python3 -c 'from tg_marketplace_parser import __version__; print(__version__)')"
+          tag="v${version}"
+          if [ "$IS_TAG" = "true" ]; then
+            [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            test "$REF_NAME" = "$tag"
+            git merge-base --is-ancestor HEAD origin/releases
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build release image
+        run: |
+          docker build \
+            --build-arg "IMAGE_VERSION=${{ steps.meta.outputs.version }}" \
+            --build-arg "IMAGE_REVISION=${GITHUB_SHA}" \
+            --build-arg "IMAGE_CREATED=${{ steps.meta.outputs.created }}" \
+            -t parser:release .
+      - name: Verify release image tests
+        run: |
+          docker run --rm --network none parser:release python -c "import parser; from importlib.metadata import version; assert version('playwright') == '1.64.1'"
+          docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD/tests:/app/tests:ro" parser:release python -m unittest discover -s tests -q
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish release images and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -eu
+          ref="$IMAGE:$VERSION"
+          if ! docker manifest inspect "$ref" > /dev/null 2>&1; then
+            docker tag parser:release "$ref"
+            docker push "$ref"
+          else
+            echo "Version tag $ref already exists in GHCR; updating sha/stable/latest tags."
+          fi
+          docker tag parser:release "$IMAGE:sha-$GITHUB_SHA"
+          docker tag parser:release "$IMAGE:stable"
+          docker tag parser:release "$IMAGE:latest"
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker push "$IMAGE:stable"
+          docker push "$IMAGE:latest"
+
+          digest="$IMAGE@$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:stable")"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            printf 'Image: `%s`\n' "$digest" > /tmp/release.md
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes --notes-file /tmp/release.md
+          fi
+          echo "Published $VERSION -> :stable, :latest ($digest)" >> "$GITHUB_STEP_SUMMARY"

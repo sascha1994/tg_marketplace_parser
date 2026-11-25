@@ -1,0 +1,231 @@
+import aiohttp
+import asyncio
+from contextlib import suppress
+import logging
+import signal
+import time
+from telethon.errors import FloodWaitError
+from telethon.utils import get_peer_id
+from .common import (
+    build_ssl_context,
+    log,
+)
+from .constants import DEFAULT_HEADERS, VIEWS_WORKER_TICK_SECONDS
+from .optional_dependencies import CurlAsyncSession
+
+
+class RuntimeMixin:
+    async def shutdown(self, sig_name: str = "SIGTERM") -> None:
+        """Корректно отключает Telegram-клиентов по сигналу остановки контейнера/процесса."""
+        log(f"Получен сигнал {sig_name}, выполняется корректное завершение работы...")
+        with suppress(Exception):
+            await self.user_client.disconnect()
+        with suppress(Exception):
+            await self.bot_client.disconnect()
+
+    def _register_signal_handlers(self) -> None:
+        with suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                with suppress(NotImplementedError, ValueError, RuntimeError):
+                    loop.add_signal_handler(
+                        sig,
+                        lambda s=sig.name: asyncio.create_task(self.shutdown(s)),
+                    )
+
+    def write_heartbeat(self) -> None:
+        """Обновляет файл heartbeat для проверки работоспособности контейнера."""
+        with suppress(OSError):
+            with open(self.settings.heartbeat_path, "w", encoding="utf-8") as handle:
+                handle.write(str(time.time()))
+
+    async def heartbeat_worker(self) -> None:
+        while True:
+            if self.user_client.is_connected() and self.bot_client.is_connected():
+                self.write_heartbeat()
+            await asyncio.sleep(self.settings.heartbeat_interval_seconds)
+
+    async def refresh_publication_views(
+        self,
+        now: int | None = None,
+        *,
+        force_unaged: bool = False,
+    ) -> None:
+        measured_at = int(time.time()) if now is None else now
+        try:
+            posts = self.db.get_posts_due_for_views(measured_at, force_unaged=force_unaged)
+        except TypeError:
+            posts = self.db.get_posts_due_for_views(measured_at)
+        if not posts:
+            return
+
+        messages = await self.user_client.get_messages(self.target_entity, ids=list(posts))
+        if not isinstance(messages, list):
+            messages = [messages]
+        measurements = []
+        measured_msg_ids: set[int] = set()
+        for message in messages:
+            msg_id = getattr(message, "id", None)
+            views = getattr(message, "views", None)
+            if (
+                msg_id in posts
+                and isinstance(views, int)
+                and not isinstance(views, bool)
+                and views >= 0
+            ):
+                measurements.append((posts[msg_id], views))
+                measured_msg_ids.add(msg_id)
+        missing_post_ids = [
+            post_id for msg_id, post_id in posts.items() if msg_id not in measured_msg_ids
+        ]
+        try:
+            self.db.save_post_views(
+                measurements,
+                measured_at,
+                missing_post_ids=missing_post_ids,
+            )
+        except TypeError:
+            self.db.save_post_views(measurements, measured_at)
+
+    async def maybe_refresh_views_on_demand(self, min_interval_seconds: int = 60) -> None:
+        if getattr(self, "target_entity", None) is None or not hasattr(self, "user_client"):
+            return
+        is_connected = getattr(self.user_client, "is_connected", None)
+        if callable(is_connected) and not is_connected():
+            return
+        now_ts = time.time()
+        last_refresh = float(getattr(self, "_last_manual_views_refresh_at", 0.0) or 0.0)
+        if now_ts - last_refresh < min_interval_seconds:
+            return
+        self._last_manual_views_refresh_at = now_ts
+        with suppress(Exception):
+            await self.refresh_publication_views(int(now_ts), force_unaged=True)
+
+    async def publication_views_worker(self) -> None:
+        while True:
+            delay = VIEWS_WORKER_TICK_SECONDS
+            try:
+                await self.refresh_publication_views()
+            except FloodWaitError as exc:
+                delay = max(delay, exc.seconds)
+                log(f"Сбор просмотров отложен из-за FloodWait на {delay} сек.", logging.WARNING)
+            except Exception as exc:
+                log(f"Не удалось обновить просмотры постов: {exc}", logging.WARNING)
+            await asyncio.sleep(delay)
+
+    async def run(self) -> None:
+        timeout = aiohttp.ClientTimeout(
+            total=self.settings.request_timeout_seconds,
+            connect=min(5, self.settings.request_timeout_seconds),
+        )
+        connector = aiohttp.TCPConnector(
+            limit=20,
+            ttl_dns_cache=300,
+            ssl=build_ssl_context(),
+        )
+        self.http_session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers=DEFAULT_HEADERS,
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+            raise_for_status=False,
+        )
+        if CurlAsyncSession is not None:
+            curl_kwargs = {
+                "impersonate": "chrome",
+                "timeout": self.settings.request_timeout_seconds,
+            }
+            if self.settings.ozon_proxy:
+                curl_kwargs["proxies"] = {
+                    "http": self.settings.ozon_proxy,
+                    "https": self.settings.ozon_proxy,
+                }
+            self.curl_session = CurlAsyncSession(**curl_kwargs)
+            log("Активирован curl_cffi (Chrome TLS/HTTP2 impersonation)")
+        else:
+            log(
+                "Пакет curl_cffi недоступен; используется браузерный резолвер Playwright + aiohttp",
+                logging.WARNING,
+            )
+
+        self._load_cached_cookies_from_disk()
+        await self.get_rub_to_byn_rate()
+        await self.browser_resolver.start_idle_monitor()
+        if self.browser_resolver.is_available:
+            log(
+                f"Активирован браузерный резолвер Ozon (Playwright Chromium, "
+                f"витрины: {', '.join(self.settings.ozon_preferred_storefronts)})"
+            )
+        else:
+            log(
+                "Playwright недоступен; для гарантированного обхода JS-антибота Ozon "
+                "установите: pip install playwright && playwright install chromium",
+                logging.WARNING,
+            )
+
+        try:
+            self._register_signal_handlers()
+            log("Авторизация Telegram-клиентов")
+            await self.user_client.start()
+            await self.bot_client.start(bot_token=self.settings.bot_token)
+
+            me = await self.user_client.get_me()
+            log(
+                f"User-клиент авторизован как: {me.first_name or ''} {me.last_name or ''} "
+                f"(@{me.username or 'без_username'}, id={me.id})"
+            )
+
+            target_reference = self.settings.target_channel
+            if target_reference.lstrip("-").isdigit():
+                target_reference = int(target_reference)
+
+            self.target_entity = await self.user_client.get_entity(target_reference)
+            self.target_peer_id = get_peer_id(self.target_entity)
+            self.channel_entities["main"] = self.target_entity
+
+            await self.update_sources()
+            await self.restore_pending_jobs()
+            await self.catch_up_sources()
+            self.workers = [
+                asyncio.create_task(self.process_worker(number), name=f"parser-worker-{number}")
+                for number in range(1, self.settings.worker_count + 1)
+            ]
+            self.publication_scheduler_task = asyncio.create_task(
+                self.scheduled_publication_worker(),
+                name="publication-scheduler",
+            )
+            self.publication_views_task = asyncio.create_task(
+                self.publication_views_worker(),
+                name="publication-views",
+            )
+            self.heartbeat_task = asyncio.create_task(self.heartbeat_worker(), name="heartbeat")
+            await self.bot_client.send_message(
+                self.settings.admin_id,
+                self.get_stats_text(),
+                buttons=self.get_admin_keyboard(),
+            )
+            await asyncio.gather(
+                self.user_client.run_until_disconnected(),
+                self.bot_client.run_until_disconnected(),
+            )
+        finally:
+            pending = [
+                *self.workers,
+                *self.album_tasks.values(),
+                *self.retry_tasks,
+                *([self.publication_scheduler_task] if self.publication_scheduler_task else []),
+                *([self.publication_views_task] if self.publication_views_task else []),
+                *([self.heartbeat_task] if self.heartbeat_task else []),
+            ]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await self.browser_resolver.close()
+            if self.curl_session is not None:
+                with suppress(Exception):
+                    await self.curl_session.close()
+            if self.http_session:
+                await self.http_session.close()
+            self.db.close()
+            await self.user_client.disconnect()
+            await self.bot_client.disconnect()
